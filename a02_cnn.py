@@ -72,6 +72,13 @@ def epochs(e):
     return 1 if QUICK else e
 
 
+def log(msg):
+    """Print and also append to RESULTS/progress.log (handy for following long runs)."""
+    print(msg, flush=True)
+    with open(f"{RESULTS}/progress.log", "a") as f:
+        f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+
+
 set_seed()
 print("device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "")
 print("torch", torch.__version__, "| QUICK =", QUICK)
@@ -225,9 +232,9 @@ def fit(model, opt, n_epochs, X, y, bs=128, aug=None, mixup_alpha=0.0, sched=Non
         if eval_train:
             msg += f" train_acc {H['train_acc'][-1]:.4f}"
         if ep == 0 or (ep + 1) % max(1, n_epochs // 10) == 0 or ep == n_epochs - 1:
-            print(msg + f" ({H['time'][-1]:.1f}s)")
+            log(msg + f" ({H['time'][-1]:.1f}s)")
         if not math.isfinite(H["train_loss"][-1]):
-            print(f"[{tag}] diverged (non-finite loss), stopping early")
+            log(f"[{tag}] diverged (non-finite loss), stopping early")
             break
     return H
 
@@ -459,7 +466,7 @@ def train_manual_mlp(n_epochs=30, lr0=0.05, bs=128):
         vl, va = acc_loss(Xf_va, y_va)
         H["val_loss"].append(vl); H["val_acc"].append(va)
         H["train_acc"].append(acc_loss(Xf_tr, y_tr)[1])
-        print(f"ep {ep + 1:2d} train_loss {H['train_loss'][-1]:.4f} train_acc {H['train_acc'][-1]:.4f} "
+        log(f"ep {ep + 1:2d} train_loss {H['train_loss'][-1]:.4f} train_acc {H['train_acc'][-1]:.4f} "
               f"val_loss {vl:.4f} val_acc {va:.4f}")
     return H
 

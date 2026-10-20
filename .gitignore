@@ -21,3 +21,5 @@ Thumbs.db
 # Smoke-test outputs
 results_quick/
 figures_quick/
+logs/
+*.log
