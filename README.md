@@ -1,4 +1,7 @@
 # EN4554 Assignment 2 — CNNs (PyTorch, CIFAR-10)
+n**Savindu Dilshan Wickramasinghe — 220701X**
+
+Main deliverable: [a02_cnn.ipynb](a02_cnn.ipynb) (executed, with outputs). Source of the notebook: [a02_cnn.py](a02_cnn.py) (percent format, built with `tools/build_notebook.py`, executed with `tools/run_notebook.py`).
 
 Assignment brief: [en4554_assignment_a2_cnn.pdf](en4554_assignment_a2_cnn.pdf)
 

@@ -1,9 +1,9 @@
 # %% [markdown]
 # # EN4554 Assignment 2 — Convolutional Neural Networks
 #
-# **Name:** `<YOUR NAME>` &nbsp;&nbsp;&nbsp; **Index No.:** `<YOUR INDEX>`
+# **Name:** Savindu Dilshan Wickramasinghe &nbsp;&nbsp;&nbsp; **Index No.:** 220701X
 #
-# **GitHub repository:** `<https://github.com/<user>/<repo>>`
+# **GitHub repository:** https://github.com/Savidilsh/EN4554-Assignment2-CNNs
 #
 # **Acknowledgement of AI tool use.** Claude (Anthropic, via Claude Code) was used as a coding assistant
 # to help write and debug the code in this notebook. I have read, run and understood all of the code and
