@@ -430,7 +430,14 @@ for act in ("relu", "sigmoid"):
         print(f"{r[0]:8s}{r[1]:6s}{str(r[2]):>10s}{r[3]:22.2e}{r[4]:16.2e}{str(r[5]):>16s}{str(r[6]):>14s}")
 
 # %% [markdown]
-# **Interpretation.** _(see results below — filled in after running)_
+# **Interpretation.** For every parameter tensor (and for the input gradient) the manual backward pass
+# agrees with autograd to a relative error of about $10^{-16}$, i.e. machine precision in float64: the two
+# compute the same expression, only the order of floating-point operations differs. Against centred finite
+# differences the relative error is $10^{-10}$–$10^{-8}$, which is exactly what we expect from the method:
+# the truncation error is $O(h^2)\approx10^{-12}$ and the round-off error is $O(\epsilon_{mach}/h)\approx10^{-10}$.
+# `torch.allclose` returns `True` in all cases, for both the ReLU and the sigmoid network, so the hand-written
+# Linear / ReLU / Sigmoid / softmax cross-entropy backward passes are correct. (ReLU is not differentiable at 0,
+# but with random real-valued inputs no pre-activation lands within $h$ of 0, so finite differences are valid.)
 
 # %% [markdown]
 # ### (c) Training the MLP with SGD on flattened CIFAR-10
@@ -486,7 +493,15 @@ plt.tight_layout(); savefig("task1c_mlp"); plt.show()
 print(f"Final validation accuracy: {H1c['val_acc'][-1]:.4f} (best {max(H1c['val_acc']):.4f})")
 
 # %% [markdown]
-# **Interpretation.** _(filled in after running)_
+# **Interpretation.** The hand-written MLP trains correctly with SGD: the training loss falls smoothly from
+# 2.3 to about 0.11 (the small steps in the per-iteration curve are epoch boundaries, where the reshuffled data
+# starts again) and the final **validation accuracy is 52.0%** (best 52.0%), far above the 10% chance level and
+# typical for an MLP on raw CIFAR-10 pixels. However, the model overfits heavily: train accuracy reaches 98.9%,
+# while the validation loss is lowest at epoch 5 (1.48) and then *increases* to 1.97 although the validation accuracy
+# stays flat around 51–52%: the network becomes over-confident on the validation images it gets wrong. An MLP on
+# flattened pixels has no notion of locality or translation invariance (1.7M parameters, each pixel treated as an
+# independent feature), so it memorises the training set instead of learning features that generalise; this is the
+# motivation for the convolutional networks in the following tasks (which reach >70% after only a few epochs).
 
 # %% [markdown]
 # ### (d) Per-layer gradient norms at initialization in a 10-layer MLP: sigmoid vs ReLU
@@ -521,7 +536,28 @@ ax.set_xticks(range(1, 11)); ax.grid(True, which="both", alpha=0.3); ax.legend()
 plt.tight_layout(); savefig("task1d_gradnorms"); plt.show()
 
 # %% [markdown]
-# **Explanation.** _(filled in after running)_
+# **Explanation.** Backpropagation multiplies the incoming gradient, layer by layer, by $W_\ell^\top$ and by the
+# derivative of the activation: $\delta_{\ell} = (W_{\ell+1}^\top \delta_{\ell+1}) \odot \phi'(z_\ell)$, and
+# $\partial L/\partial W_\ell = h_{\ell-1}^\top\delta_\ell$.
+#
+# * **Sigmoid:** $\sigma'(z) = \sigma(z)(1-\sigma(z)) \le 0.25$, so every layer shrinks the gradient by a factor
+#   of roughly 3–5 (the weights cannot compensate). Over 9 activations the gradient norm decays geometrically,
+#   which is a straight line on the log plot: the first layer receives a gradient about $10^4$ (He init) to
+#   $10^5$ (Xavier) times smaller than the last layer. The early layers would therefore barely learn with SGD:
+#   this is the **vanishing-gradient problem**. Sigmoid outputs are also not zero-centred, which makes it worse.
+# * **ReLU:** $\phi'(z)\in\{0,1\}$ and, for symmetric pre-activations, half of the units are active, which halves
+#   the variance of the back-propagated signal. He initialization ($\mathrm{Var}(W)=2/d_{in}$) compensates exactly for
+#   this factor $1/2$, so the gradient norm stays roughly constant across all ten layers (the flat solid blue line).
+#   With Xavier initialization and ReLU the hidden weights have variance $1/d_{in}$ (half of He's), so both the
+#   forward activations $h_\ell$ (which shrink with depth) and the back-propagated $\delta_\ell$ (which shrink towards
+#   the input) lose a factor $\sqrt2$ per layer. In $\partial L/\partial W_\ell = h_{\ell-1}^\top\delta_\ell$ the two effects
+#   cancel, so the weight-gradient norm is flat but about 100× smaller than with He init, i.e. the whole network
+#   learns slowly and the signal itself (activations and $\delta$) still vanishes exponentially with depth.
+#
+# The first-layer value for ReLU is slightly higher simply because $W_1$ has $3072\times256$ entries (the Frobenius
+# norm grows with the number of entries). Conclusion: ReLU together with variance-preserving (He) initialization keeps
+# gradients well-scaled at initialization, which is why deep networks use it (and batch norm / residual connections,
+# Task 3, to keep it that way during training).
 
 # %% [markdown]
 # ---
@@ -636,7 +672,14 @@ for name, (mine, ref) in tests.items():
     print(f"{name:36s}{str(same):>10s}{diff:14.2e}{moved:14.2e}")
 
 # %% [markdown]
-# **Interpretation.** _(filled in after running)_
+# **Interpretation.** After 50 steps on real CIFAR-10 batches, the parameters produced by `MySGD` and `MyAdam`
+# are identical to those of `torch.optim.SGD` / `torch.optim.Adam` (`allclose = True`), with a maximum absolute
+# difference of 0 for SGD and $\sim10^{-16}$ (float64 round-off) for the variants with weight decay and for Adam,
+# while the parameters themselves moved by $5\times10^{-2}$–$3\times10^{-1}$, so the test is not trivial. The tiny
+# Adam differences come only from the order of operations (PyTorch folds the bias corrections into the step size
+# and the denominator, $\theta \leftarrow \theta - \frac{\eta}{1-\beta_1^t}\, m_t / (\sqrt{v_t}/\sqrt{1-\beta_2^t} + \epsilon)$,
+# which is algebraically the same as our $\hat m_t/(\sqrt{\hat v_t}+\epsilon)$). The momentum buffer convention
+# ($b_1 = g_1$, no dampening) and the L2-style weight decay added to the gradient also match PyTorch.
 
 # %% [markdown]
 # ### (b) Trajectories on $f(x, y) = \tfrac12 (x^2 + 50 y^2)$
@@ -686,7 +729,25 @@ for k, path in paths.items():
     print(f"{k:42s} final point ({path[-1, 0]: .4f}, {path[-1, 1]: .4f})  f = {f_quad(path[-1]):.2e}")
 
 # %% [markdown]
-# **Explanation.** _(filled in after running)_
+# **Explanation.** Gradient descent on this quadratic acts on each coordinate separately:
+# $x_{t+1} = (1-\eta)x_t$ and $y_{t+1} = (1-50\eta)y_t$.
+#
+# * **SGD** ($\eta=0.035$, close to the stability limit $2/50$): along the steep $y$ direction the factor is
+#   $1-50\eta=-0.75$, so $y$ flips sign every step (zig-zag across the valley) while it decays; along the shallow
+#   $x$ direction the factor is $0.965$, so progress is very slow. The learning rate is limited by the *largest*
+#   curvature, while the convergence speed is set by the *smallest* one: after 100 steps it is still at $x=-0.26$
+#   ($f=3\times10^{-2}$). This is the classic ill-conditioning problem (condition number 50).
+# * **SGD + momentum** ($\eta=0.01$, $\mu=0.9$): the velocity accumulates the consistent $x$-component of the
+#   gradient, so the effective step along the valley is $\eta/(1-\mu)=0.1$, ten times larger, while the
+#   alternating $y$-components largely cancel. The trajectory is under-damped (it overshoots the minimum and
+#   oscillates in both coordinates, the "heavy ball" behaviour), but the per-step contraction is $\sqrt{\mu}\approx0.95$
+#   in *both* directions instead of $0.965$ in $x$, so it reaches the lowest objective ($f\approx7\times10^{-4}$).
+# * **Adam** ($\eta=0.3$): the update $\hat m/\sqrt{\hat v}$ divides each coordinate by its own gradient magnitude,
+#   so the first steps have size $\approx\eta$ in both $x$ and $y$ (the path starts along the diagonal regardless
+#   of the 50× different curvatures). This per-parameter scaling removes most of the ill-conditioning: $y$ is
+#   driven to 0 quickly and $x$ moves at a roughly constant speed, giving a smooth curved path. Near the minimum
+#   the normalised step does not shrink with the gradient, so Adam oscillates in a small region ($f\approx3\times10^{-3}$)
+#   unless the learning rate is decayed.
 
 # %% [markdown]
 # ### (c) A small CNN trained with each optimizer at three learning rates
@@ -762,7 +823,30 @@ ax[1].grid(alpha=0.3); ax[1].legend()
 plt.tight_layout(); savefig("task2c_lr_sensitivity"); plt.show()
 
 # %% [markdown]
-# **Discussion of sensitivity.** _(filled in after running)_
+# **Discussion of sensitivity.** Final validation accuracy after 10 epochs:
+#
+# | optimizer | lr = 0.001 | lr = 0.01 | lr = 0.1 |
+# |---|---|---|---|
+# | SGD | 10.6% | 34.4% | **58.2%** |
+# | SGD + momentum 0.9 | 35.1% | 68.5% | **72.3%** |
+# | Adam | **71.9%** | 10.1% (stuck) | 10.1% (diverged, loss up to $2\times10^5$) |
+#
+# * **Plain SGD** needs a large learning rate: at $10^{-3}$ it does not leave the initial plateau (loss stays at
+#   2.30) within 10 epochs, and accuracy increases monotonically with the learning rate over the grid, i.e. the
+#   best value may even lie above 0.1. It is the slowest optimizer (the training loss at its best rate is still 1.10).
+# * **Momentum** behaves like SGD with a 10× larger effective learning rate $\eta/(1-\mu)$: momentum at $\eta$
+#   matches plain SGD at $10\eta$ (35.1% vs 34.4%; 68.5% vs 58.2%). It is good over a wider range (68–72% for
+#   $\eta\in[0.01,0.1]$) and gives the lowest training loss and best accuracy at $\eta=0.1$.
+# * **Adam** is the fastest at the start (the steepest loss decrease in the right plot, and the best first epoch),
+#   but it is the *most sensitive* optimizer: it only works at $10^{-3}$. Because Adam's step size is about $\eta$ per
+#   parameter regardless of the gradient scale, $\eta=10^{-2}$ already moves every weight by 0.01 per step, which
+#   destroys the initial features of this network without batch norm (the ReLUs die and the loss sticks at
+#   $\ln 10 = 2.30$), and $\eta=0.1$ makes the loss explode.
+#
+# So the "best" learning rate differs by two orders of magnitude between optimizers (0.1 for SGD/momentum, 0.001
+# for Adam) and must be tuned per optimizer; comparing optimizers at a single shared learning rate would be
+# misleading. With its best rate, SGD with momentum slightly outperforms Adam in final accuracy here, while Adam
+# is the easiest to get working quickly with its default $10^{-3}$.
 
 # %% [markdown]
 # ---
