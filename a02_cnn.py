@@ -1039,7 +1039,7 @@ R4 = {k: cached(f"task4_{k.replace(' ', '_').replace('(', '').replace(')', '').r
                 lambda k=k: run_4(k, epochs(20))) for k in VARIANTS_4}
 
 # %%
-print(f"{'variant':28s}{'params':>9s}{'final val acc':>15s}{'Δ vs full':>11s}{'final train loss':>18s}")
+print(f"{'variant':28s}{'params':>9s}{'final val acc':>15s}{'vs full':>11s}{'final train loss':>18s}")
 base = R4["full model"]["val_acc"][-1]
 for k, H in R4.items():
     print(f"{k:28s}{H['params']:9,d}{H['val_acc'][-1]:15.4f}{H['val_acc'][-1] - base:+11.4f}"
