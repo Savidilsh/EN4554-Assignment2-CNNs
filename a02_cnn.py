@@ -933,7 +933,39 @@ ax.set_title("Final train vs validation accuracy (5k training images)"); ax.lege
 plt.tight_layout(); savefig("task3a_gap"); plt.show()
 
 # %% [markdown]
-# **Interpretation.** _(filled in after running)_
+# **Interpretation.** Results after 100 epochs on 5k images (train accuracy on clean training images):
+#
+# | variant | train acc | val acc | gap | final val loss |
+# |---|---|---|---|---|
+# | baseline | 100.0% | 68.2% | 31.8 | 1.41 |
+# | weight decay | 100.0% | 67.9% | 32.1 | 1.26 |
+# | dropout | 98.2% | 70.1% | 28.1 | 0.97 |
+# | flip + crop | 96.8% | **73.9%** | 22.9 | 0.95 |
+# | cutout | 100.0% | 71.1% | 28.9 | 1.20 |
+# | mixup | 100.0% | 68.6% | 31.4 | 0.97 |
+# | all combined | 76.2% | 67.0% | **9.2** | **0.93** |
+#
+# * With only 5k images the **baseline** memorises the training set within ~35 epochs (100% train accuracy) and
+#   stalls at 68% validation accuracy: a 32-point generalisation gap. Its validation loss is also the highest and
+#   very noisy, because the network becomes over-confident.
+# * **Flip + crop** is the most effective single regulariser (+5.7 points, smallest gap among single methods):
+#   it encodes real invariances of natural images (left–right symmetry, small translations), effectively
+#   multiplying the size of the training set. **Cutout** (+2.9) forces the network to use several parts of the
+#   object instead of a single discriminative patch, but on its own the network still reaches 100% on clean
+#   training images. **Dropout** (+1.9) reduces co-adaptation of features and is the only single method besides
+#   flip+crop that keeps train accuracy below 100%.
+# * **Weight decay** barely changes accuracy here. With batch norm after every conv the network output is invariant
+#   to the scale of the conv weights, so L2 mainly increases the effective learning rate rather than restricting
+#   capacity; it does lower the validation loss (1.41 → 1.26). **Mixup** gives a similar accuracy to the baseline, but
+#   the validation loss drops from 1.41 to 0.97: training on interpolated images with soft targets makes the predictions
+#   much better calibrated (less over-confident), even though the arg-max decisions change little.
+# * **All combined** has by far the smallest gap (9 points) and the lowest validation loss, but it **underfits**: the
+#   train accuracy only reaches 76% and validation accuracy (67%) is lower than with flip+crop alone. Stacking five
+#   regularisers on a 0.14M-parameter network trained for only 4k iterations removes too much effective capacity;
+#   the curves are still rising at epoch 100, so a bigger model or a longer schedule would be needed to benefit from it.
+#
+# In short, regularisation trades training fit for generalisation; the best choice depends on the capacity/data/compute
+# balance, and data augmentation that reflects true invariances (flip + crop) is the most valuable when data is scarce.
 
 # %% [markdown]
 # ### (b) Plain vs residual CIFAR networks of depth $6n+2$ (8, 20, 56)
