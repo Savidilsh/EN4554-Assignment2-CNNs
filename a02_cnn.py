@@ -12,38 +12,65 @@
 # All experiments use PyTorch and CIFAR-10. The 50k training images are split once (fixed seed) into
 # 45k train / 5k validation, every image is normalized per channel with the mean/std of the 45k training
 # images, and the test set is touched exactly once, at the very end of Task 4.
+#
+# **Contents**
+# 0. Setup: data split, normalization, GPU batching and augmentation, training loop
+# 1. Task 1: Backpropagation (manual layers, gradient checks, MLP training, gradient flow)
+# 2. Task 2: Optimizers (custom SGD-momentum / Adam, trajectories, learning-rate sensitivity)
+# 3. Task 3: Regularization (5k images) and plain vs residual networks (depth 8 / 20 / 56)
+# 4. Task 4: Best CNN with ≤ 500k parameters and ≤ 20 epochs, ablation, single test evaluation
+#
+# Each sub-task has: a short description of the method and settings → code → outputs (logs, tables, plots) →
+# an **Interpretation** of the measured results.
 
 # %% [markdown]
 # ## 0. Setup
 #
-# For speed (Colab T4 or a laptop GPU) the whole normalized dataset is kept on the GPU and mini-batches,
-# random crop/flip, cutout and mixup are all done with tensor ops on the GPU, which avoids the CPU
-# `DataLoader` bottleneck. Every run's history is cached as JSON in `results/` so that a crashed or
-# interrupted session can be resumed without retraining finished runs.
+# **Environment.** The notebook runs on a Colab T4 or on a laptop GPU (the outputs below were produced on an
+# NVIDIA GTX 1650, 4 GB). On Colab, results are saved to Google Drive so that a disconnected session can be resumed.
+#
+# **Speed.** The whole normalized dataset is kept on the GPU, and mini-batching, random crop/flip, cutout and mixup
+# are all done with tensor operations on the GPU, avoiding the CPU `DataLoader` bottleneck. Mixed precision (fp16)
+# is used only on GPUs with tensor cores (e.g. T4); on the GTX 1650 fp16 is ~3.5× slower than fp32, so fp32 is used.
+#
+# **Resumability.** Every training run is cached as JSON (history + its printed training log) in `results/`.
+# Re-running the notebook re-uses finished runs and prints their saved logs instead of training again.
 
 # %%
 import copy, json, math, os, random, time, warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+from IPython.display import display
 
 warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*")
+pd.set_option("display.precision", 4)
 
 SEED = 0
 QUICK = os.environ.get("A2_QUICK", "0") == "1"  # smoke-test mode: a few batches per run
-DATA_DIR = os.environ.get("A2_DATA", "./data")
-RESULTS = "results_quick" if QUICK else "results"
-FIGS = "figures_quick" if QUICK else "figures"
-CKPT = "checkpoints"
-for d in (RESULTS, FIGS, CKPT):
+
+try:  # on Colab, keep data/results on Google Drive
+    from google.colab import drive
+    drive.mount("/content/drive")
+    BASE = "/content/drive/MyDrive/EN4554_A2"
+except ImportError:
+    BASE = "."
+DATA_DIR = os.path.join(BASE, "data")
+RESULTS = os.path.join(BASE, "results_quick" if QUICK else "results")
+FIGS = os.path.join(BASE, "figures_quick" if QUICK else "figures")
+CKPT = os.path.join(BASE, "checkpoints")
+for d in (DATA_DIR, RESULTS, FIGS, CKPT):
     os.makedirs(d, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-AMP = device.type == "cuda"  # fp16 autocast on GPU
+# fp16 autocast only pays off on GPUs with tensor cores (compute capability >= 7.0, not the GTX 16xx series)
+AMP = (device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 7
+       and "GTX" not in torch.cuda.get_device_name(0))
 torch.backends.cudnn.benchmark = True
 
 
@@ -56,13 +83,36 @@ def savefig(name):
     plt.savefig(f"{FIGS}/{name}.png", dpi=130, bbox_inches="tight")
 
 
+_LOG_CAPTURE = None
+
+
+def log(msg):
+    """Print a training-log line (also kept with the cached run and appended to RESULTS/progress.log)."""
+    print(msg, flush=True)
+    if _LOG_CAPTURE is not None:
+        _LOG_CAPTURE.append(msg)
+    with open(f"{RESULTS}/progress.log", "a") as f:
+        f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+
+
 def cached(name, fn):
-    """Run fn() once and cache its JSON-serialisable result in RESULTS/name.json."""
+    """Run fn() once and cache its result (a dict) with its training log in RESULTS/name.json.
+    If the run was already done, load it and print the saved training log instead of retraining."""
+    global _LOG_CAPTURE
     path = f"{RESULTS}/{name}.json"
     if os.path.exists(path):
         with open(path) as f:
-            return json.load(f)
-    out = fn()
+            out = json.load(f)
+        print(f"[{name}: loaded saved run; its training log was:]")
+        for line in out.get("_log", []):
+            print("  " + line)
+        return out
+    _LOG_CAPTURE = []
+    try:
+        out = fn()
+        out["_log"] = _LOG_CAPTURE
+    finally:
+        _LOG_CAPTURE = None
     with open(path, "w") as f:
         json.dump(out, f)
     return out
@@ -72,16 +122,9 @@ def epochs(e):
     return 1 if QUICK else e
 
 
-def log(msg):
-    """Print and also append to RESULTS/progress.log (handy for following long runs)."""
-    print(msg, flush=True)
-    with open(f"{RESULTS}/progress.log", "a") as f:
-        f.write(time.strftime("%H:%M:%S ") + msg + "\n")
-
-
 set_seed()
-print("device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "")
-print("torch", torch.__version__, "| QUICK =", QUICK)
+print("device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "", "| mixed precision:", AMP)
+print("torch", torch.__version__, "| results in", os.path.abspath(RESULTS), "| QUICK =", QUICK)
 
 # %% [markdown]
 # ### Data: 45k / 5k split and per-channel normalization with training statistics
@@ -112,8 +155,16 @@ X_te = normalize(torch.from_numpy(test_set.data).permute(0, 3, 1, 2))
 y_te = torch.tensor(test_set.targets)
 
 print("train", tuple(X_tr.shape), "val", tuple(X_va.shape), "test", tuple(X_te.shape))
-print("mean", MEAN.numpy().round(4), "std", STD.numpy().round(4))
-print("val class counts", torch.bincount(y_va.cpu()).tolist())
+print("per-channel mean (R, G, B):", MEAN.numpy().round(4), " std:", STD.numpy().round(4))
+display(pd.DataFrame({"train (45k)": torch.bincount(y_tr.cpu()).tolist(),
+                      "validation (5k)": torch.bincount(y_va.cpu()).tolist()}, index=CLASSES).T)
+
+# a few (un-normalized) training images
+fig, axes = plt.subplots(2, 10, figsize=(15, 3.4))
+for k, ax in enumerate(axes.flat):
+    i = int(tr_idx[k])
+    ax.imshow(train_set.data[i]); ax.set_title(CLASSES[train_set.targets[i]], fontsize=8); ax.axis("off")
+plt.suptitle("Sample CIFAR-10 training images"); plt.tight_layout(); plt.show()
 
 # %% [markdown]
 # ### Batching, GPU augmentation (flip + crop, cutout, mixup) and a generic training loop
@@ -423,11 +474,11 @@ def grad_check(act):
     return rows
 
 
-print(f"{'act':8s}{'param':6s}{'shape':>10s}{'rel.err vs autograd':>22s}{'rel.err vs FD':>16s}"
-      f"{'allclose(auto)':>16s}{'allclose(FD)':>14s}")
-for act in ("relu", "sigmoid"):
-    for r in grad_check(act):
-        print(f"{r[0]:8s}{r[1]:6s}{str(r[2]):>10s}{r[3]:22.2e}{r[4]:16.2e}{str(r[5]):>16s}{str(r[6]):>14s}")
+gc = pd.DataFrame([r for act in ("relu", "sigmoid") for r in grad_check(act)],
+                  columns=["activation", "gradient", "shape", "rel. error vs autograd", "rel. error vs FD",
+                           "allclose (autograd)", "allclose (FD)"])
+display(gc.style.format({"rel. error vs autograd": "{:.2e}", "rel. error vs FD": "{:.2e}"}).hide(axis="index"))
+print("all gradients match:", bool(gc["allclose (autograd)"].all() and gc["allclose (FD)"].all()))
 
 # %% [markdown]
 # **Interpretation.** For every parameter tensor (and for the input gradient) the manual backward pass
@@ -525,15 +576,19 @@ def layer_grad_norms(act, init, seeds=range(5)):
 
 
 fig, ax = plt.subplots(figsize=(7.5, 4.5))
+gn = {}
 for act, c in (("sigmoid", "tab:red"), ("relu", "tab:blue")):
     for init, ls in (("he", "-"), ("xavier", "--")):
-        g = layer_grad_norms(act, init)
+        g = gn[f"{act}, {init} init"] = layer_grad_norms(act, init)
         ax.semilogy(range(1, 11), g, ls, color=c, marker="o", label=f"{act}, {init} init")
-        print(f"{act:8s}{init:7s}", " ".join(f"{v:.1e}" for v in g))
 ax.set(xlabel="layer (1 = input side, 10 = output side)", ylabel=r"$\|\partial L/\partial W_\ell\|_F$ (log)",
        title="Per-layer gradient norm at initialization, 10-layer MLP")
 ax.set_xticks(range(1, 11)); ax.grid(True, which="both", alpha=0.3); ax.legend()
 plt.tight_layout(); savefig("task1d_gradnorms"); plt.show()
+
+gn = pd.DataFrame(gn, index=[f"layer {i}" for i in range(1, 11)]).T
+gn["layer 1 / layer 10"] = gn["layer 1"] / gn["layer 10"]
+display(gn.style.format("{:.1e}"))
 
 # %% [markdown]
 # **Explanation.** Backpropagation multiplies the incoming gradient, layer by layer, by $W_\ell^\top$ and by the
@@ -666,10 +721,11 @@ tests = {
                                          lambda p: torch.optim.Adam(p, lr=3e-3, betas=(0.8, 0.99),
                                                                     weight_decay=1e-3)),
 }
-print(f"{'optimizer':36s}{'allclose':>10s}{'max |diff|':>14s}{'max |change|':>14s}")
-for name, (mine, ref) in tests.items():
-    same, diff, moved = compare_optimizers(mine, ref)
-    print(f"{name:36s}{str(same):>10s}{diff:14.2e}{moved:14.2e}")
+opt_check = pd.DataFrame([(name, *compare_optimizers(mine, ref)) for name, (mine, ref) in tests.items()],
+                         columns=["optimizer (ours vs torch.optim)", "allclose", "max |difference|",
+                                  "max |parameter change|"])
+display(opt_check.style.format({"max |difference|": "{:.2e}", "max |parameter change|": "{:.2e}"})
+        .hide(axis="index"))
 
 # %% [markdown]
 # **Interpretation.** After 50 steps on real CIFAR-10 batches, the parameters produced by `MySGD` and `MyAdam`
@@ -725,8 +781,11 @@ ax[0].set(xlabel="x", ylabel="y", title=r"Trajectories on $f(x,y)=\frac{1}{2}(x^
 ax[0].legend(loc="upper right")
 ax[1].set(xlabel="iteration", ylabel="f (log)", title="Objective vs iteration"); ax[1].grid(alpha=0.3)
 plt.tight_layout(); savefig("task2b_trajectories"); plt.show()
-for k, path in paths.items():
-    print(f"{k:42s} final point ({path[-1, 0]: .4f}, {path[-1, 1]: .4f})  f = {f_quad(path[-1]):.2e}")
+display(pd.DataFrame([(k.replace("$", "").replace("\\eta", "lr").replace("\\mu", "momentum"), *path[-1],
+                       f_quad(path[-1])) for k, path in paths.items()],
+                     columns=["method", "x after 100 steps", "y after 100 steps", "f after 100 steps"])
+        .style.format({"x after 100 steps": "{:.4f}", "y after 100 steps": "{:.4f}", "f after 100 steps": "{:.2e}"})
+        .hide(axis="index"))
 
 # %% [markdown]
 # **Explanation.** Gradient descent on this quadratic acts on each coordinate separately:
@@ -808,10 +867,8 @@ def final_acc(H):
 
 fig, ax = plt.subplots(1, 2, figsize=(15, 4.5))
 colors = dict(zip(OPTS_2C, ["tab:red", "tab:blue", "tab:green"]))
-print(f"{'optimizer':14s}" + "".join(f"{'lr=' + format(lr, 'g'):>12s}" for lr in LRS_2C) + "   (final val acc)")
 for o in OPTS_2C:
     accs = [final_acc(R2c[(o, lr)]) for lr in LRS_2C]
-    print(f"{o:14s}" + "".join(f"{a:12.4f}" for a in accs))
     ax[0].semilogx(LRS_2C, accs, "o-", color=colors[o], label=o)
     best = LRS_2C[int(np.argmax(accs))]
     ax[1].plot(smooth(R2c[(o, best)]["iter_loss"], 50), color=colors[o], label=f"{o} (best lr={best:g})")
@@ -821,6 +878,14 @@ ax[1].set(xlabel="iteration", ylabel="training loss (moving avg, 50 it)",
           title="Training loss at the best learning rate")
 ax[1].grid(alpha=0.3); ax[1].legend()
 plt.tight_layout(); savefig("task2c_lr_sensitivity"); plt.show()
+
+t2c = pd.DataFrame({f"lr = {lr:g}": [final_acc(R2c[(o, lr)]) for o in OPTS_2C] for lr in LRS_2C}, index=list(OPTS_2C))
+t2c["best lr"] = [f"{LRS_2C[int(np.argmax(row))]:g}" for row in t2c.values]
+t2c["final train loss at best lr"] = [R2c[(o, float(b))]["train_loss"][-1] for o, b in zip(OPTS_2C, t2c["best lr"])]
+print("Final validation accuracy after 10 epochs:")
+display(t2c.style.format({c: "{:.2%}" for c in t2c.columns if c.startswith("lr")} |
+                         {"final train loss at best lr": "{:.3f}"}).highlight_max(
+    axis=None, subset=[c for c in t2c.columns if c.startswith("lr")], color="#c6efce"))
 
 # %% [markdown]
 # **Discussion of sensitivity.** Final validation accuracy after 10 epochs:
@@ -901,10 +966,13 @@ R3a = {k: cached(f"task3a_{k.replace(' ', '_').replace('+', '_')}", lambda k=k: 
        for k in VARIANTS_3A}
 
 # %%
-print(f"{'variant':14s}{'train acc':>11s}{'val acc':>10s}{'gap':>8s}{'best val':>10s}")
-for k, H in R3a.items():
-    tr, va = H["train_acc"][-1], H["val_acc"][-1]
-    print(f"{k:14s}{tr:11.4f}{va:10.4f}{tr - va:8.4f}{max(H['val_acc']):10.4f}")
+t3a = pd.DataFrame({k: {"train acc": H["train_acc"][-1], "val acc": H["val_acc"][-1],
+                        "gap (train - val)": H["train_acc"][-1] - H["val_acc"][-1],
+                        "best val acc": max(H["val_acc"]), "final val loss": H["val_loss"][-1]}
+                    for k, H in R3a.items()}).T
+print("Final epoch (100) on the 5k-image training subset:")
+display(t3a.style.format({c: "{:.2%}" for c in t3a.columns if c != "final val loss"} | {"final val loss": "{:.3f}"})
+        .highlight_max(subset=["val acc"], color="#c6efce").highlight_min(subset=["gap (train - val)"], color="#c6efce"))
 
 fig, axes = plt.subplots(1, 3, figsize=(18, 4.8))
 cmap = plt.get_cmap("tab10")
@@ -982,7 +1050,7 @@ plt.tight_layout(); savefig("task3a_gap"); plt.show()
 #
 # Training (identical for all 6 networks): SGD, momentum 0.9, weight decay $10^{-4}$, batch 128, peak learning
 # rate 0.1 with 1 epoch of linear warm-up and cosine decay, flip + crop augmentation, 20 epochs on the 45k split
-# (mixed precision on the GPU).
+# (fp32 on the GTX 1650; fp16 mixed precision is used automatically on tensor-core GPUs such as the T4).
 
 # %%
 class ShortcutA(nn.Module):
@@ -1068,7 +1136,7 @@ for d in (8, 20, 56):
 # %%
 def run_3b(depth, residual, n_epochs=20):
     set_seed()
-    model = depth_net(depth, residual).to(device).to(memory_format=torch.channels_last)
+    model = depth_net(depth, residual).to(device)
     opt = MySGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
     spe = math.ceil(len(y_tr) / 128)
     return fit(model, opt, n_epochs, X_tr, y_tr, bs=128, aug=flip_crop,
@@ -1096,10 +1164,17 @@ for a in ax:
     a.grid(alpha=0.3, which="both"); a.legend(fontsize=8)
 plt.tight_layout(); savefig("task3b_plain_vs_residual"); plt.show()
 
-print(f"{'depth':>6s}{'plain loss':>12s}{'res loss':>10s}{'plain val':>11s}{'res val':>9s}   (final epoch)")
-for d in (8, 20, 56):
-    p, r = R3b[(d, False)], R3b[(d, True)]
-    print(f"{d:6d}{p['train_loss'][-1]:12.4f}{r['train_loss'][-1]:10.4f}{p['val_acc'][-1]:11.4f}{r['val_acc'][-1]:9.4f}")
+t3b = pd.DataFrame([{"depth": d, "parameters": n_params(depth_net(d, True)),
+                     "plain: train loss": R3b[(d, False)]["train_loss"][-1],
+                     "residual: train loss": R3b[(d, True)]["train_loss"][-1],
+                     "plain: val acc": R3b[(d, False)]["val_acc"][-1],
+                     "residual: val acc": R3b[(d, True)]["val_acc"][-1],
+                     "plain: s/epoch": np.mean(R3b[(d, False)]["time"]),
+                     "residual: s/epoch": np.mean(R3b[(d, True)]["time"])} for d in (8, 20, 56)]).set_index("depth")
+print("Final epoch (20):")
+display(t3b.style.format({"parameters": "{:,}"} | {c: "{:.4f}" for c in t3b.columns if "loss" in c}
+                         | {c: "{:.2%}" for c in t3b.columns if "acc" in c}
+                         | {c: "{:.1f}" for c in t3b.columns if "s/epoch" in c}))
 
 # %% [markdown]
 # **Explanation.** _(filled in after running)_
@@ -1116,7 +1191,7 @@ for d in (8, 20, 56):
 # * SGD with Nesterov momentum 0.9, batch 128, peak LR 0.1, 1 epoch linear warm-up then cosine decay to 0,
 # * weight decay $5\times10^{-4}$, label smoothing 0.1,
 # * augmentation: random flip + crop and cutout (16×16),
-# * mixed precision, 20 epochs on the 45k training split; model selection only on the 5k validation split.
+# * 20 epochs on the 45k training split; model selection only on the 5k validation split.
 #
 # **Ablation.** Each variant changes one design choice of the full model and is trained with the same seed
 # and budget. The final model is the variant with the best validation accuracy; only that model is
@@ -1143,7 +1218,6 @@ def run_4(name, n_epochs=20):
     cfg = VARIANTS_4[name]
     set_seed()
     model = CifarNet(**{**T4_ARCH, "residual": cfg.get("residual", True)}).to(device)
-    model = model.to(memory_format=torch.channels_last)
     wd = cfg.get("wd", 5e-4)
     if cfg.get("opt") == "adamw":
         opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=5e-2)
@@ -1162,11 +1236,14 @@ R4 = {k: cached(f"task4_{k.replace(' ', '_').replace('(', '').replace(')', '').r
                 lambda k=k: run_4(k, epochs(20))) for k in VARIANTS_4}
 
 # %%
-print(f"{'variant':28s}{'params':>9s}{'final val acc':>15s}{'vs full':>11s}{'final train loss':>18s}")
 base = R4["full model"]["val_acc"][-1]
-for k, H in R4.items():
-    print(f"{k:28s}{H['params']:9,d}{H['val_acc'][-1]:15.4f}{H['val_acc'][-1] - base:+11.4f}"
-          f"{H['train_loss'][-1]:18.4f}")
+t4 = pd.DataFrame({k: {"parameters": H["params"], "val acc": H["val_acc"][-1],
+                       "change vs full model": H["val_acc"][-1] - base, "best val acc": max(H["val_acc"]),
+                       "final train loss": H["train_loss"][-1]} for k, H in R4.items()}).T
+print("Ablation, final epoch (20), validation split:")
+display(t4.style.format({"parameters": "{:,.0f}", "val acc": "{:.2%}", "change vs full model": "{:+.2%}",
+                         "best val acc": "{:.2%}", "final train loss": "{:.4f}"})
+        .highlight_max(subset=["val acc"], color="#c6efce"))
 
 fig, ax = plt.subplots(1, 2, figsize=(16, 4.8))
 for i, (k, H) in enumerate(R4.items()):
