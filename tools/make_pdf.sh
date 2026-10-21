@@ -13,6 +13,7 @@ css = ("<style>@media print { .jp-Cell { break-inside: auto; } } "
 open(p, "w", encoding="utf-8").write(s.replace("</head>", css + "</head>", 1))
 PY
 EDGE="/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+rm -f "$NAME.pdf"  # Edge does not overwrite an existing file
 "$EDGE" --headless=new --disable-gpu --no-pdf-header-footer --virtual-time-budget=30000 --user-data-dir="$(cygpath -w "$TEMP")\\edgepdf" \
-  --print-to-pdf="$(cygpath -w "$PWD")\$NAME.pdf" "file:///$(cygpath -m "$PWD")/$NAME.html" 2>/dev/null
+  --print-to-pdf="$(cygpath -w "$PWD/$NAME.pdf")" "file:///$(cygpath -m "$PWD")/$NAME.html" 2>&1 | grep -v "sync\|GetUpdates\|task_provider" || true
 ls -la "$NAME.pdf"
