@@ -24,3 +24,6 @@ figures_quick/
 logs/
 *.log
 
+
+# HTML export (PDF is committed)
+220701X_a02.html

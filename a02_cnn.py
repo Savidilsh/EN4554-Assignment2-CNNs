@@ -14,6 +14,7 @@
 # images, and the test set is touched exactly once, at the very end of Task 4.
 #
 # **Contents**
+#
 # 0. Setup: data split, normalization, GPU batching and augmentation, training loop
 # 1. Task 1: Backpropagation (manual layers, gradient checks, MLP training, gradient flow)
 # 2. Task 2: Optimizers (custom SGD-momentum / Adam, trajectories, learning-rate sensitivity)
@@ -1016,7 +1017,7 @@ plt.tight_layout(); savefig("task3a_gap"); plt.show()
 # * With only 5k images the **baseline** memorises the training set within ~35 epochs (100% train accuracy) and
 #   stalls at 68% validation accuracy: a 32-point generalisation gap. Its validation loss is also the highest and
 #   very noisy, because the network becomes over-confident.
-# * **Flip + crop** is the most effective single regulariser (+5.7 points, smallest gap among single methods):
+# * **Flip + crop** is the most effective single regulariser (+5.8 points, smallest gap among single methods):
 #   it encodes real invariances of natural images (left–right symmetry, small translations), effectively
 #   multiplying the size of the training set. **Cutout** (+2.9) forces the network to use several parts of the
 #   object instead of a single discriminative patch, but on its own the network still reaches 100% on clean
@@ -1177,7 +1178,33 @@ display(t3b.style.format({"parameters": "{:,}"} | {c: "{:.4f}" for c in t3b.colu
                          | {c: "{:.1f}" for c in t3b.columns if "s/epoch" in c}))
 
 # %% [markdown]
-# **Explanation.** _(filled in after running)_
+# **Explanation.** Final training loss / validation accuracy after 20 epochs:
+#
+# | depth | plain | residual |
+# |---|---|---|
+# | 8 | 0.450 / 82.9% | 0.477 / 83.0% |
+# | 20 | 0.319 / 85.6% | 0.232 / 88.1% |
+# | 56 | **1.147 / 59.3%** | **0.168 / 88.9%** |
+#
+# * **Plain networks degrade with depth.** Going from 8 to 20 layers still helps a little, but the 56-layer plain
+#   network is dramatically *worse*: its training loss after 20 epochs (1.15) is 2.5× that of the 8-layer plain
+#   network, and its loss curve decreases only slowly from the start. Because it is the **training** loss that is
+#   higher (and the validation accuracy is lower by the same amount), this is not overfitting but an
+#   **optimization problem**: a 56-layer network can represent everything the 8-layer one can (extra layers could
+#   learn the identity), yet SGD fails to find such a solution. This is the *degradation problem* of He et al.
+#   Even with batch norm and Kaiming initialization (so the gradients do not simply vanish at initialization, cf.
+#   Task 1(d)), the composition of 54 non-linear layers is a badly conditioned function to optimize, and the
+#   gradient signal reaching the early layers is weak and noisy.
+# * **Residual networks improve with depth**: training loss 0.48 → 0.23 → 0.17 and validation accuracy
+#   83.0% → 88.1% → 88.9%. With a shortcut each block only has to learn a residual $F(x) = H(x) - x$; driving
+#   $F$ towards 0 gives the identity, so extra depth can never hurt much, and the identity paths carry the gradient
+#   unchanged to every layer ($\partial x_L/\partial x_\ell = I + \partial(\sum F)/\partial x_\ell$), which makes the deep
+#   network as easy to optimize as a shallow one. ResNet-56 has the lowest training loss of all six models and also
+#   the best validation accuracy.
+# * At **depth 8** the shortcut makes no difference (the two curves overlap): a 3-block network is easy to optimize
+#   either way. The benefit of the shortcut grows with depth (+2.5 points at 20 layers, +29.7 points at 56 layers),
+#   and since the shortcuts are parameter-free (option A) the comparison isolates the effect of the skip connection
+#   itself. The cost of depth is compute: ResNet-56 needs about 8× the time per epoch of ResNet-8 on this GPU.
 
 # %% [markdown]
 # ---
@@ -1258,7 +1285,40 @@ for a in ax:
 plt.tight_layout(); savefig("task4_ablation"); plt.show()
 
 # %% [markdown]
-# **Ablation discussion.** _(filled in after running)_
+# **Ablation discussion.** All variants have the same 20-epoch budget and seed (final-epoch validation accuracy):
+#
+# | variant | val acc | change | final train loss |
+# |---|---|---|---|
+# | full model (flip + crop + cutout, wd $5\times10^{-4}$, LS 0.1, SGD-Nesterov) | 88.96% | – | 0.823 |
+# | no shortcut (plain) | 88.78% | −0.18 | 0.815 |
+# | no augmentation | 86.54% | −2.42 | 0.526 |
+# | **no cutout (flip + crop only)** | **90.78%** | **+1.82** | 0.662 |
+# | no weight decay | 86.48% | −2.48 | 0.906 |
+# | no label smoothing | 89.26% | +0.30 | 0.368 |
+# | AdamW instead of SGD | 87.10% | −1.86 | 0.875 |
+#
+# (With label smoothing 0.1 the training loss cannot go below ≈0.5, so losses are only comparable among the
+# label-smoothed runs.)
+#
+# * **Augmentation** matters most on the data side: without any augmentation the training loss drops to the
+#   label-smoothing floor (memorisation) and validation accuracy falls by 2.4 points. But **cutout on top of
+#   flip + crop hurts with only 20 epochs** (−1.8 points vs flip + crop only): the training loss is still high (0.82 vs
+#   0.66), i.e. the model is *under*-fitted. Cutout is a strong regulariser that pays off in long (200-epoch) schedules,
+#   not in a 20-epoch budget, the same capacity/budget trade-off as "all combined" in Task 3(a).
+# * **Weight decay** is essential (−2.5 points without it). Interestingly its removal makes the *training* loss higher,
+#   not lower: with batch norm the convolutions are scale-invariant, and without weight decay their norms grow, which
+#   shrinks the effective learning rate $\eta/\|w\|^2$ and slows optimization. So in BN networks weight decay acts mainly
+#   as an effective-learning-rate control.
+# * **Optimizer:** AdamW (lr $2\times10^{-3}$, decoupled wd 0.05, same schedule) is 1.9 points worse than SGD with Nesterov
+#   momentum, in line with Task 2(c) where tuned momentum-SGD also edged out Adam on CIFAR.
+# * **Shortcut:** at this depth (14 layers) removing the shortcuts costs only 0.2 points, consistent with Task 3(b) where
+#   the gap between plain and residual networks is small for shallow networks and only becomes large with depth.
+#   It is kept because it makes optimization robust and costs no time.
+# * **Label smoothing** changes accuracy by only +0.3 points (within run-to-run noise of a few tenths of a percent).
+#
+# Following the selection rule (best final validation accuracy), the **final model is the residual network with
+# flip + crop (no cutout), weight decay $5\times10^{-4}$, label smoothing 0.1 and SGD-Nesterov** (460,548 parameters,
+# 20 epochs, 90.78% validation accuracy).
 
 # %% [markdown]
 # ### Final model: single evaluation on the test set
@@ -1307,8 +1367,21 @@ ax[1].set(title="Per-class test accuracy", xlabel="accuracy"); ax[1].invert_yaxi
 plt.tight_layout(); savefig("task4_test"); plt.show()
 
 # %% [markdown]
-# **Test result.** _(filled in after running)_
+# **Test result.** The selected model reaches **90.36% test accuracy** (evaluated once), with 460,548 parameters
+# (< 500k) and 20 training epochs. This is only 0.4 points below its validation accuracy (90.78%), so selecting among
+# seven variants on the 5k validation split introduced little optimistic bias. The per-class results show where the
+# remaining errors are: vehicles are easiest (automobile 95.6%, ship 94.7%, truck 93.6%), while the animal classes with
+# similar shapes and textures are hardest: **cat (80.0%) and dog (85.1%) are mostly confused with each other** (85 cats
+# predicted as dog and 86 dogs as cat), and bird (85.5%) is confused with airplane, deer and frog. The vehicle errors
+# are also semantically sensible (truck ↔ automobile, ship ↔ airplane, which share sky/sea backgrounds).
 #
 # ---
 # ## Summary
-# _(filled in after running)_
+#
+# | task | key result |
+# |---|---|
+# | 1 | Manual backprop matches autograd to ~$10^{-16}$ and finite differences to ~$10^{-9}$; MLP: 52.0% val. accuracy with strong overfitting; sigmoid gradients vanish ~$10^4$× over 10 layers, ReLU + He init keeps them constant. |
+# | 2 | Own SGD-momentum/Adam match `torch.optim` exactly; momentum and Adam fix the zig-zag of SGD on an ill-conditioned quadratic; Adam is best at lr $10^{-3}$ but fails at $\ge 10^{-2}$, momentum-SGD is the most robust (72.3% at lr 0.1). |
+# | 3a | On 5k images flip + crop is the best single regulariser (68.2% → 73.9%); combining all regularisers minimises the gap (9 points) but underfits. |
+# | 3b | Plain nets degrade with depth (56 layers: train loss 1.15, 59.3%), residual nets improve (ResNet-56: 0.17, 88.9%): shortcuts solve an optimization problem, not overfitting. |
+# | 4 | 460k-parameter ResNet, 20 epochs: **90.36% test accuracy**; weight decay and augmentation matter most, cutout hurts at this short budget. |
