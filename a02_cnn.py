@@ -1,41 +1,19 @@
 # %% [markdown]
-# # EN4554 Assignment 2 — Convolutional Neural Networks
+# # EN4554 - Deep Learning for Vision
+# ## Assignment 2: Convolutional Neural Networks
 #
-# **Name:** Savindu Dilshan Wickramasinghe &nbsp;&nbsp;&nbsp; **Index No.:** 220701X
+# **Name:** Savindu Dilshan Wickramasinghe
+#
+# **Index number:** 220701X
 #
 # **GitHub repository:** https://github.com/Savidilsh/EN4554-Assignment2-CNNs
 #
-# **Acknowledgement of AI tool use.** Claude (Anthropic, via Claude Code) was used as a coding assistant
-# to help write and debug the code in this notebook. I have read, run and understood all of the code and
-# the interpretations below.
-#
-# All experiments use PyTorch and CIFAR-10. The 50k training images are split once (fixed seed) into
-# 45k train / 5k validation, every image is normalized per channel with the mean/std of the 45k training
-# images, and the test set is touched exactly once, at the very end of Task 4.
-#
-# **Contents**
-#
-# 0. Setup: data split, normalization, GPU batching and augmentation, training loop
-# 1. Task 1: Backpropagation (manual layers, gradient checks, MLP training, gradient flow)
-# 2. Task 2: Optimizers (custom SGD-momentum / Adam, trajectories, learning-rate sensitivity)
-# 3. Task 3: Regularization (5k images) and plain vs residual networks (depth 8 / 20 / 56)
-# 4. Task 4: Best CNN with ≤ 500k parameters and ≤ 20 epochs, ablation, single test evaluation
-#
-# Each sub-task has: a short description of the method and settings → code → outputs (logs, tables, plots) →
-# an **Interpretation** of the measured results.
+# **AI assistance acknowledgment:** Claude (Anthropic) was used to help write and debug the code in this notebook. I have reviewed and understood all of the code and the results.
 
 # %% [markdown]
-# ## 0. Setup
+# ## Setup
 #
-# **Environment.** The notebook runs on a Colab T4 or on a laptop GPU (the outputs below were produced on an
-# NVIDIA GTX 1650, 4 GB). On Colab, results are saved to Google Drive so that a disconnected session can be resumed.
-#
-# **Speed.** The whole normalized dataset is kept on the GPU, and mini-batching, random crop/flip, cutout and mixup
-# are all done with tensor operations on the GPU, avoiding the CPU `DataLoader` bottleneck. Mixed precision (fp16)
-# is used only on GPUs with tensor cores (e.g. T4); on the GTX 1650 fp16 is ~3.5× slower than fp32, so fp32 is used.
-#
-# **Resumability.** Every training run is cached as JSON (history + its printed training log) in `results/`.
-# Re-running the notebook re-uses finished runs and prints their saved logs instead of training again.
+# The notebook runs on a Colab T4 or a local GPU. The outputs below were produced on an NVIDIA GTX 1650. The normalized dataset is kept on the GPU, and batching and augmentation are done with tensor operations, which is faster than a CPU `DataLoader`. Mixed precision is used only on GPUs with tensor cores. Completed training runs are saved in `results/` and are loaded instead of retrained when the notebook is run again.
 
 # %%
 import copy, json, math, os, random, time, warnings
@@ -53,23 +31,22 @@ warnings.filterwarnings("ignore", message=".*lr_scheduler.step.*")
 pd.set_option("display.precision", 4)
 
 SEED = 0
-QUICK = os.environ.get("A2_QUICK", "0") == "1"  # smoke-test mode: a few batches per run
 
-try:  # on Colab, keep data/results on Google Drive
+try:  # on Colab, keep data and results on Google Drive
     from google.colab import drive
     drive.mount("/content/drive")
     BASE = "/content/drive/MyDrive/EN4554_A2"
 except ImportError:
     BASE = "."
 DATA_DIR = os.path.join(BASE, "data")
-RESULTS = os.path.join(BASE, "results_quick" if QUICK else "results")
-FIGS = os.path.join(BASE, "figures_quick" if QUICK else "figures")
+RESULTS = os.path.join(BASE, "results")
+FIGS = os.path.join(BASE, "figures")
 CKPT = os.path.join(BASE, "checkpoints")
 for d in (DATA_DIR, RESULTS, FIGS, CKPT):
     os.makedirs(d, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# fp16 autocast only pays off on GPUs with tensor cores (compute capability >= 7.0, not the GTX 16xx series)
+# fp16 autocast only on GPUs with tensor cores
 AMP = (device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 7
        and "GTX" not in torch.cuda.get_device_name(0))
 torch.backends.cudnn.benchmark = True
@@ -84,51 +61,47 @@ def savefig(name):
     plt.savefig(f"{FIGS}/{name}.png", dpi=130, bbox_inches="tight")
 
 
-_LOG_CAPTURE = None
+_LOG = None
 
 
 def log(msg):
-    """Print a training-log line (also kept with the cached run and appended to RESULTS/progress.log)."""
+    """Print a training log line and keep it with the saved run."""
     print(msg, flush=True)
-    if _LOG_CAPTURE is not None:
-        _LOG_CAPTURE.append(msg)
-    with open(f"{RESULTS}/progress.log", "a") as f:
-        f.write(time.strftime("%H:%M:%S ") + msg + "\n")
+    if _LOG is not None:
+        _LOG.append(msg)
 
 
 def cached(name, fn):
-    """Run fn() once and cache its result (a dict) with its training log in RESULTS/name.json.
-    If the run was already done, load it and print the saved training log instead of retraining."""
-    global _LOG_CAPTURE
+    """Run fn() once and save the result with its training log in RESULTS/name.json.
+    If the run already exists, load it and print its saved training log."""
+    global _LOG
     path = f"{RESULTS}/{name}.json"
     if os.path.exists(path):
         with open(path) as f:
             out = json.load(f)
-        print(f"[{name}: loaded saved run; its training log was:]")
+        print(f"Loaded saved run: {name}")
         for line in out.get("_log", []):
-            print("  " + line)
+            print(line)
         return out
-    _LOG_CAPTURE = []
+    _LOG = []
     try:
         out = fn()
-        out["_log"] = _LOG_CAPTURE
+        out["_log"] = _LOG
     finally:
-        _LOG_CAPTURE = None
+        _LOG = None
     with open(path, "w") as f:
         json.dump(out, f)
     return out
 
 
-def epochs(e):
-    return 1 if QUICK else e
-
-
 set_seed()
-print("device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "", "| mixed precision:", AMP)
-print("torch", torch.__version__, "| results in", os.path.abspath(RESULTS), "| QUICK =", QUICK)
+print("Device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "", "| mixed precision:", AMP)
+print("PyTorch", torch.__version__)
 
 # %% [markdown]
-# ### Data: 45k / 5k split and per-channel normalization with training statistics
+# ### Data
+#
+# CIFAR-10 is split into 45,000 training and 5,000 validation images using seed 0. Normalization uses the per-channel mean and standard deviation of the 45,000 training images only. The test set stays on the CPU and is used only for the final evaluation in Task 4.
 
 # %%
 train_set = torchvision.datasets.CIFAR10(DATA_DIR, train=True, download=True)
@@ -168,15 +141,15 @@ for k, ax in enumerate(axes.flat):
 plt.suptitle("Sample CIFAR-10 training images"); plt.tight_layout(); plt.show()
 
 # %% [markdown]
-# ### Batching, GPU augmentation (flip + crop, cutout, mixup) and a generic training loop
+# ### Training utilities
+#
+# `flip_crop`, `cutout` and `mixup` work on GPU batches. `fit` trains a model and records the training loss, validation loss and validation accuracy after every epoch (and, optionally, the accuracy on the clean training images).
 
 # %%
 def batches(X, y, bs, shuffle=True):
     n = len(y)
     idx = torch.randperm(n, device=X.device) if shuffle else torch.arange(n, device=X.device)
-    for k, i in enumerate(range(0, n, bs)):
-        if QUICK and k >= 3:
-            break
+    for i in range(0, n, bs):
         j = idx[i:i + bs]
         yield X[j], y[j]
 
@@ -235,7 +208,7 @@ def cosine_warmup(opt, total_steps, warmup_steps=0):
 @torch.no_grad()
 def evaluate(model, X, y, bs=1000):
     model.eval()
-    n = 1000 if QUICK else len(y)
+    n = len(y)
     loss, correct = 0.0, 0
     for i in range(0, n, bs):
         xb, yb = X[i:i + bs].to(device), y[i:i + bs].to(device)
@@ -302,18 +275,16 @@ def smooth(v, k=50):
     return np.convolve(v, np.ones(k) / k, mode="valid")
 
 # %% [markdown]
-# ---
 # ## Task 1: Backpropagation
 #
-# ### (a) Linear, ReLU and softmax cross-entropy with explicit forward/backward (no autograd)
+# ### 1(a): Manual layers and MLP
 #
-# Each layer caches what it needs in `forward` and implements the chain rule in `backward`:
+# Each layer stores what it needs in `forward` and applies the chain rule in `backward`. No autograd is used.
 #
 # * **Linear** $Y = XW + b$: $\;\partial L/\partial W = X^\top G$, $\;\partial L/\partial b = \sum_n G_n$, $\;\partial L/\partial X = G W^\top$, where $G = \partial L/\partial Y$.
 # * **ReLU** $y=\max(0,x)$: $\;\partial L/\partial x = G \odot \mathbb 1[x>0]$.
-# * **Sigmoid** (needed for 1(d)) $s=\sigma(x)$: $\;\partial L/\partial x = G \odot s(1-s)$.
-# * **Softmax cross-entropy** with mean over the batch: $L = -\frac1N\sum_n \log p_{n,y_n}$, $\;\partial L/\partial z = (p - \text{onehot}(y))/N$.
-#   The forward pass subtracts the row max (log-sum-exp trick) for numerical stability.
+# * **Sigmoid** (used in 1(d)) $s=\sigma(x)$: $\;\partial L/\partial x = G \odot s(1-s)$.
+# * **Softmax cross-entropy**, averaged over the batch: $L = -\frac1N\sum_n \log p_{n,y_n}$, $\;\partial L/\partial z = (p - \text{onehot}(y))/N$. The row maximum is subtracted before the exponential for numerical stability.
 
 # %%
 class Linear:
@@ -407,13 +378,9 @@ class MLP:
             lin.b -= lr * lin.db
 
 # %% [markdown]
-# ### (b) Gradient check against autograd and centred finite differences
+# ### 1(b): Gradient check
 #
-# A small MLP (12-10-8-5) in float64 on a random batch. For every parameter tensor we compare the manual
-# gradient $g_m$ with (i) the autograd gradient of an equivalent `torch` graph sharing the same weights, and
-# (ii) centred finite differences $\big(L(\theta+h e_i) - L(\theta-h e_i)\big)/2h$ with $h=10^{-6}$.
-# The relative error is $\|g_m - g\|_2 / \max(\|g_m\|_2 + \|g\|_2, 10^{-12})$.
-# The check is done for both the ReLU and the sigmoid network (the latter is used in 1(d)).
+# A small MLP (12-10-8-5) in float64 is evaluated on a random batch of 6 inputs. Every parameter gradient and the input gradient are compared with autograd and with centred finite differences, $\big(L(\theta+h e_i) - L(\theta-h e_i)\big)/2h$ with $h=10^{-6}$. The relative error is $\|g_m - g\|_2 / (\|g_m\|_2 + \|g\|_2)$. The check is done for a ReLU and a sigmoid network.
 
 # %%
 def rel_err(a, b):
@@ -482,20 +449,12 @@ display(gc.style.format({"rel. error vs autograd": "{:.2e}", "rel. error vs FD":
 print("all gradients match:", bool(gc["allclose (autograd)"].all() and gc["allclose (FD)"].all()))
 
 # %% [markdown]
-# **Interpretation.** For every parameter tensor (and for the input gradient) the manual backward pass
-# agrees with autograd to a relative error of about $10^{-16}$, i.e. machine precision in float64: the two
-# compute the same expression, only the order of floating-point operations differs. Against centred finite
-# differences the relative error is $10^{-10}$–$10^{-8}$, which is exactly what we expect from the method:
-# the truncation error is $O(h^2)\approx10^{-12}$ and the round-off error is $O(\epsilon_{mach}/h)\approx10^{-10}$.
-# `torch.allclose` returns `True` in all cases, for both the ReLU and the sigmoid network, so the hand-written
-# Linear / ReLU / Sigmoid / softmax cross-entropy backward passes are correct. (ReLU is not differentiable at 0,
-# but with random real-valued inputs no pre-activation lands within $h$ of 0, so finite differences are valid.)
+# **Interpretation:** All manual gradients match autograd with relative errors around **1e-16**, which is floating-point rounding in float64. Against finite differences the errors are **1e-10 to 1e-8**. This is the expected accuracy of the finite-difference approximation with $h=10^{-6}$: the truncation error is of order $h^2$ and the rounding error of order $\epsilon/h$. `torch.allclose` is True for every parameter and for the input gradient, for both activations, so the backward passes are correct.
 
 # %% [markdown]
-# ### (c) Training the MLP with SGD on flattened CIFAR-10
+# ### 1(c): Training the manual MLP
 #
-# MLP 3072 → 512 → 256 → 10 with ReLU, He initialization, mini-batch SGD (batch 128, learning rate 0.05
-# with cosine decay), 30 epochs, using only the hand-written forward/backward above (no autograd).
+# MLP 3072-512-256-10 with ReLU and He initialization, trained with mini-batch SGD (batch 128, learning rate 0.05 with cosine decay, 30 epochs). Only the manual forward and backward passes from 1(a) are used.
 
 # %%
 def train_manual_mlp(n_epochs=30, lr0=0.05, bs=128):
@@ -518,9 +477,8 @@ def train_manual_mlp(n_epochs=30, lr0=0.05, bs=128):
         H["train_loss"].append(float(np.mean(il)))
 
         def acc_loss(Xf, y):
-            n = 1000 if QUICK else len(y)
-            out = torch.cat([net.forward(Xf[i:i + 1000]) for i in range(0, n, 1000)])
-            return net.loss_fn.forward(out, y[:n]).item(), (out.argmax(1) == y[:n]).float().mean().item()
+            out = torch.cat([net.forward(Xf[i:i + 1000]) for i in range(0, len(y), 1000)])
+            return net.loss_fn.forward(out, y).item(), (out.argmax(1) == y).float().mean().item()
 
         vl, va = acc_loss(Xf_va, y_va)
         H["val_loss"].append(vl); H["val_acc"].append(va)
@@ -530,7 +488,7 @@ def train_manual_mlp(n_epochs=30, lr0=0.05, bs=128):
     return H
 
 
-H1c = cached("task1c_mlp", lambda: train_manual_mlp(epochs(30)))
+H1c = cached("task1c_mlp", lambda: train_manual_mlp(30))
 
 fig, ax = plt.subplots(1, 3, figsize=(16, 4))
 ax[0].plot(H1c["iter_loss"], alpha=0.25, lw=0.5, label="per iteration")
@@ -545,24 +503,14 @@ plt.tight_layout(); savefig("task1c_mlp"); plt.show()
 print(f"Final validation accuracy: {H1c['val_acc'][-1]:.4f} (best {max(H1c['val_acc']):.4f})")
 
 # %% [markdown]
-# **Interpretation.** The hand-written MLP trains correctly with SGD: the training loss falls smoothly from
-# 2.3 to about 0.11 (the small steps in the per-iteration curve are epoch boundaries, where the reshuffled data
-# starts again) and the final **validation accuracy is 52.0%** (best 52.0%), far above the 10% chance level and
-# typical for an MLP on raw CIFAR-10 pixels. However, the model overfits heavily: train accuracy reaches 98.9%,
-# while the validation loss is lowest at epoch 5 (1.48) and then *increases* to 1.97 although the validation accuracy
-# stays flat around 51–52%: the network becomes over-confident on the validation images it gets wrong. An MLP on
-# flattened pixels has no notion of locality or translation invariance (1.7M parameters, each pixel treated as an
-# independent feature), so it memorises the training set instead of learning features that generalise; this is the
-# motivation for the convolutional networks in the following tasks (which reach >70% after only a few epochs).
+# **Interpretation:** The training loss falls from about 2.3 to **0.11**, and the final validation accuracy is **52.0%**. Training accuracy reaches 98.9%, so the model overfits strongly. The validation loss is lowest at epoch 5 (1.48) and then rises to 1.97 while the validation accuracy stays around 51-52%, so the model becomes more confident on the validation images it gets wrong.
+#
+# An MLP on flattened pixels does not use the local structure of images and is not translation invariant. With 1.7M parameters it memorises the training images instead of learning features that generalise. The CNNs in the later tasks reach much higher accuracy with fewer parameters.
 
 # %% [markdown]
-# ### (d) Per-layer gradient norms at initialization in a 10-layer MLP: sigmoid vs ReLU
+# ### 1(d): Gradient norms in a 10-layer MLP
 #
-# A 10-layer MLP (3072 → 9 × 256 hidden → 10) is evaluated at initialization on a batch of 512 real
-# training images, and $\|\partial L/\partial W_\ell\|_F$ is recorded for every layer $\ell$ (layer 1 is next to
-# the input). We use the same network with the activation as the only change, for two standard
-# initializations (He: $\mathrm{Var}(W)=2/d_{in}$; Xavier: $\mathrm{Var}(W)=2/(d_{in}+d_{out})$), averaged
-# over 5 random initializations.
+# The network has 10 linear layers (3072 → 9 hidden layers of 256 → 10); layer 1 is next to the input. At initialization, $\|\partial L/\partial W_\ell\|_F$ is computed on a fixed batch of 512 training images for sigmoid and ReLU. The same weights are used for both activations. Two initializations are shown, He ($\mathrm{Var}(W)=2/d_{in}$) and Xavier ($\mathrm{Var}(W)=2/(d_{in}+d_{out})$), each averaged over 5 seeds.
 
 # %%
 def layer_grad_norms(act, init, seeds=range(5)):
@@ -592,40 +540,23 @@ gn["layer 1 / layer 10"] = gn["layer 1"] / gn["layer 10"]
 display(gn.style.format("{:.1e}"))
 
 # %% [markdown]
-# **Explanation.** Backpropagation multiplies the incoming gradient, layer by layer, by $W_\ell^\top$ and by the
-# derivative of the activation: $\delta_{\ell} = (W_{\ell+1}^\top \delta_{\ell+1}) \odot \phi'(z_\ell)$, and
-# $\partial L/\partial W_\ell = h_{\ell-1}^\top\delta_\ell$.
+# **Interpretation:** During backpropagation $\delta_{\ell} = (W_{\ell+1}^\top \delta_{\ell+1}) \odot \phi'(z_\ell)$ and $\partial L/\partial W_\ell = h_{\ell-1}^\top\delta_\ell$.
 #
-# * **Sigmoid:** $\sigma'(z) = \sigma(z)(1-\sigma(z)) \le 0.25$, so every layer shrinks the gradient by a factor
-#   of roughly 3–5 (the weights cannot compensate). Over 9 activations the gradient norm decays geometrically,
-#   which is a straight line on the log plot: the first layer receives a gradient about $10^4$ (He init) to
-#   $10^5$ (Xavier) times smaller than the last layer. The early layers would therefore barely learn with SGD:
-#   this is the **vanishing-gradient problem**. Sigmoid outputs are also not zero-centred, which makes it worse.
-# * **ReLU:** $\phi'(z)\in\{0,1\}$ and, for symmetric pre-activations, half of the units are active, which halves
-#   the variance of the back-propagated signal. He initialization ($\mathrm{Var}(W)=2/d_{in}$) compensates exactly for
-#   this factor $1/2$, so the gradient norm stays roughly constant across all ten layers (the flat solid blue line).
-#   With Xavier initialization and ReLU the hidden weights have variance $1/d_{in}$ (half of He's), so both the
-#   forward activations $h_\ell$ (which shrink with depth) and the back-propagated $\delta_\ell$ (which shrink towards
-#   the input) lose a factor $\sqrt2$ per layer. In $\partial L/\partial W_\ell = h_{\ell-1}^\top\delta_\ell$ the two effects
-#   cancel, so the weight-gradient norm is flat but about 100× smaller than with He init, i.e. the whole network
-#   learns slowly and the signal itself (activations and $\delta$) still vanishes exponentially with depth.
+# With **sigmoid**, $\sigma'(z) \le 0.25$, so the gradient shrinks at every layer. On the log scale this is a straight line: the gradient of layer 1 is about **$10^4$ (He) to $10^5$ (Xavier) times smaller** than that of layer 10. The early layers would learn very slowly, which is the vanishing-gradient problem.
 #
-# The first-layer value for ReLU is slightly higher simply because $W_1$ has $3072\times256$ entries (the Frobenius
-# norm grows with the number of entries). Conclusion: ReLU together with variance-preserving (He) initialization keeps
-# gradients well-scaled at initialization, which is why deep networks use it (and batch norm / residual connections,
-# Task 3, to keep it that way during training).
+# With **ReLU**, $\phi'$ is 0 or 1 and about half of the units are active. He initialization doubles the weight variance to compensate for this, so the gradient norm stays roughly constant across layers. With Xavier initialization the curve is also flat but about 100 times lower: the activations shrink in the forward pass and $\delta$ shrinks in the backward pass, and the two effects cancel in $h^\top\delta$. Layer 1 has a slightly larger norm because $W_1$ has many more entries (3072 × 256).
+#
+# This is why ReLU with He initialization is the usual choice for deep networks.
 
 # %% [markdown]
-# ---
 # ## Task 2: Optimizers
 #
-# ### (a) SGD with momentum and Adam (with bias correction) as `torch.optim.Optimizer` subclasses
+# ### 2(a): SGD with momentum and Adam
 #
-# * **SGD + momentum** (PyTorch convention, no dampening): $g \leftarrow \nabla_\theta L + \lambda\theta$,
-#   $\;b_t = \mu b_{t-1} + g$ (with $b_1 = g$), $\;\theta \leftarrow \theta - \eta\, b_t$.
-# * **Adam**: $m_t = \beta_1 m_{t-1} + (1-\beta_1) g$, $\;v_t = \beta_2 v_{t-1} + (1-\beta_2) g^2$,
-#   bias correction $\hat m_t = m_t/(1-\beta_1^t)$, $\hat v_t = v_t/(1-\beta_2^t)$,
-#   $\;\theta \leftarrow \theta - \eta\, \hat m_t / (\sqrt{\hat v_t} + \epsilon)$.
+# Both are implemented as `torch.optim.Optimizer` subclasses.
+#
+# * **SGD with momentum** (no dampening, as in PyTorch): $g = \nabla_\theta L + \lambda\theta$, $\;b_t = \mu b_{t-1} + g$ with $b_1 = g$, $\;\theta \leftarrow \theta - \eta\, b_t$.
+# * **Adam**: $m_t = \beta_1 m_{t-1} + (1-\beta_1) g$, $\;v_t = \beta_2 v_{t-1} + (1-\beta_2) g^2$, bias correction $\hat m_t = m_t/(1-\beta_1^t)$, $\hat v_t = v_t/(1-\beta_2^t)$, $\;\theta \leftarrow \theta - \eta\, \hat m_t / (\sqrt{\hat v_t} + \epsilon)$.
 
 # %%
 class MySGD(torch.optim.Optimizer):
@@ -686,10 +617,7 @@ class MyAdam(torch.optim.Optimizer):
         return loss
 
 # %% [markdown]
-# **Equivalence test.** Two copies of the same small CNN (float64) are trained for 50 steps on the same
-# CIFAR-10 mini-batches, one with our optimizer and one with the PyTorch reference; all parameters are
-# compared at the end with `torch.allclose` (and the max absolute difference is reported, next to how far
-# the parameters moved, to show that the comparison is not trivial).
+# Two copies of the same small CNN (float64) are trained for 50 steps on the same CIFAR-10 batches, one with our optimizer and one with the PyTorch optimizer. The final parameters are compared with `torch.allclose`. The table also shows the maximum parameter change, to confirm that the parameters actually moved.
 
 # %%
 def compare_optimizers(make_mine, make_ref, steps=50):
@@ -729,21 +657,12 @@ display(opt_check.style.format({"max |difference|": "{:.2e}", "max |parameter ch
         .hide(axis="index"))
 
 # %% [markdown]
-# **Interpretation.** After 50 steps on real CIFAR-10 batches, the parameters produced by `MySGD` and `MyAdam`
-# are identical to those of `torch.optim.SGD` / `torch.optim.Adam` (`allclose = True`), with a maximum absolute
-# difference of 0 for SGD and $\sim10^{-16}$ (float64 round-off) for the variants with weight decay and for Adam,
-# while the parameters themselves moved by $5\times10^{-2}$–$3\times10^{-1}$, so the test is not trivial. The tiny
-# Adam differences come only from the order of operations (PyTorch folds the bias corrections into the step size
-# and the denominator, $\theta \leftarrow \theta - \frac{\eta}{1-\beta_1^t}\, m_t / (\sqrt{v_t}/\sqrt{1-\beta_2^t} + \epsilon)$,
-# which is algebraically the same as our $\hat m_t/(\sqrt{\hat v_t}+\epsilon)$). The momentum buffer convention
-# ($b_1 = g_1$, no dampening) and the L2-style weight decay added to the gradient also match PyTorch.
+# **Interpretation:** Both optimizers match PyTorch in all five settings. The maximum difference is **0** for SGD and momentum and about **1e-16** with weight decay and for Adam, while the parameters moved by up to 0.27. The small Adam difference is floating-point rounding: PyTorch applies the bias corrections in a different order, which is algebraically the same. Because the check runs over 50 consecutive steps, it also confirms that the stored state (momentum buffer, Adam moments and step count) is updated correctly.
 
 # %% [markdown]
-# ### (b) Trajectories on $f(x, y) = \tfrac12 (x^2 + 50 y^2)$
+# ### 2(b): Trajectories on $f(x, y) = \tfrac12 (x^2 + 50 y^2)$
 #
-# $\nabla f = (x,\; 50y)$, so the Hessian is $\mathrm{diag}(1, 50)$ (condition number 50). Plain gradient
-# descent is stable only for $\eta < 2/50 = 0.04$. All three methods start at $(-9, 1.5)$, run for 100 steps
-# and use our own optimizer classes from (a); the gradient is computed by autograd.
+# The gradient is $(x,\; 50y)$, so the curvature is 50 times larger along $y$. Plain gradient descent is stable only for $\eta < 2/50 = 0.04$. All methods start at $(-9, 1.5)$ and run for 100 updates with our optimizers: SGD with $\eta=0.035$, momentum with $\eta=0.01, \mu=0.9$, and Adam with $\eta=0.3$.
 
 # %%
 def f_quad(p):
@@ -789,35 +708,18 @@ display(pd.DataFrame([(k.replace("$", "").replace("\\eta", "lr").replace("\\mu",
         .hide(axis="index"))
 
 # %% [markdown]
-# **Explanation.** Gradient descent on this quadratic acts on each coordinate separately:
-# $x_{t+1} = (1-\eta)x_t$ and $y_{t+1} = (1-50\eta)y_t$.
+# **Interpretation:** The final objective values are **3.3e-2 for SGD**, **7.5e-4 for momentum** and **2.8e-3 for Adam**.
 #
-# * **SGD** ($\eta=0.035$, close to the stability limit $2/50$): along the steep $y$ direction the factor is
-#   $1-50\eta=-0.75$, so $y$ flips sign every step (zig-zag across the valley) while it decays; along the shallow
-#   $x$ direction the factor is $0.965$, so progress is very slow. The learning rate is limited by the *largest*
-#   curvature, while the convergence speed is set by the *smallest* one: after 100 steps it is still at $x=-0.26$
-#   ($f=3\times10^{-2}$). This is the classic ill-conditioning problem (condition number 50).
-# * **SGD + momentum** ($\eta=0.01$, $\mu=0.9$): the velocity accumulates the consistent $x$-component of the
-#   gradient, so the effective step along the valley is $\eta/(1-\mu)=0.1$, ten times larger, while the
-#   alternating $y$-components largely cancel. The trajectory is under-damped (it overshoots the minimum and
-#   oscillates in both coordinates, the "heavy ball" behaviour), but the per-step contraction is $\sqrt{\mu}\approx0.95$
-#   in *both* directions instead of $0.965$ in $x$, so it reaches the lowest objective ($f\approx7\times10^{-4}$).
-# * **Adam** ($\eta=0.3$): the update $\hat m/\sqrt{\hat v}$ divides each coordinate by its own gradient magnitude,
-#   so the first steps have size $\approx\eta$ in both $x$ and $y$ (the path starts along the diagonal regardless
-#   of the 50× different curvatures). This per-parameter scaling removes most of the ill-conditioning: $y$ is
-#   driven to 0 quickly and $x$ moves at a roughly constant speed, giving a smooth curved path. Near the minimum
-#   the normalised step does not shrink with the gradient, so Adam oscillates in a small region ($f\approx3\times10^{-3}$)
-#   unless the learning rate is decayed.
+# * **SGD:** each step multiplies $y$ by $1-50\eta=-0.75$, so the path zig-zags across the valley, while $x$ only shrinks by a factor 0.965 per step. The step size is limited by the steep direction, so progress along the flat direction is slow; after 100 steps $x$ is still -0.26.
+# * **Momentum:** the velocity builds up along $x$, where the gradient keeps the same sign, giving an effective step of $\eta/(1-\mu)=0.1$. The alternating $y$ components partly cancel. The path overshoots and oscillates, but it reaches the lowest objective.
+# * **Adam:** each coordinate is scaled by its own gradient magnitude, so the first steps have a similar size in $x$ and $y$ and the path starts diagonally. This removes most of the effect of the different curvatures. Near the minimum the step does not shrink with the gradient, so Adam keeps oscillating slightly unless the learning rate is decayed.
+#
+# The three methods use different learning rates, so this is not a general ranking.
 
 # %% [markdown]
-# ### (c) A small CNN trained with each optimizer at three learning rates
+# ### 2(c): Learning-rate sensitivity
 #
-# Small CNN without batch norm (so that the optimizer, not normalization, determines stability):
-# `[conv3-32, conv3-32, pool] → [conv3-64, conv3-64, pool] → [conv3-128, pool] → GAP → FC-10`, ReLU, about
-# 0.14M parameters. Each of the 9 runs uses the same initialization (seed), the same data order, batch size
-# 128, a constant learning rate from the common grid $\{10^{-3}, 10^{-2}, 10^{-1}\}$, 10 epochs, no
-# augmentation, full fp32 precision, and our optimizer implementations from (a) (momentum 0.9; Adam with
-# default betas).
+# The same CNN (about 0.14M parameters, no batch norm) is trained with each optimizer at learning rates 0.001, 0.01 and 0.1. All nine runs use the same seed and data order, batch size 128, a constant learning rate, 10 epochs, no augmentation and fp32. The best learning rate of each optimizer is selected by final validation accuracy.
 
 # %%
 class SmallCNN(nn.Module):
@@ -855,7 +757,7 @@ def run_2c(opt_name, lr):
     set_seed()
     model = SmallCNN().to(device)
     opt = OPTS_2C[opt_name](model.parameters(), lr)
-    return fit(model, opt, epochs(10), X_tr, y_tr, bs=128, amp=False, tag=f"{opt_name} lr={lr:g}")
+    return fit(model, opt, 10, X_tr, y_tr, bs=128, amp=False, tag=f"{opt_name} lr={lr:g}")
 
 
 R2c = {(o, lr): cached(f"task2c_{o}_lr{lr:g}", lambda o=o, lr=lr: run_2c(o, lr))
@@ -889,53 +791,27 @@ display(t2c.style.format({c: "{:.2%}" for c in t2c.columns if c.startswith("lr")
     axis=None, subset=[c for c in t2c.columns if c.startswith("lr")], color="#c6efce"))
 
 # %% [markdown]
-# **Discussion of sensitivity.** Final validation accuracy after 10 epochs:
+# **Interpretation:**
 #
-# | optimizer | lr = 0.001 | lr = 0.01 | lr = 0.1 |
-# |---|---|---|---|
-# | SGD | 10.6% | 34.4% | **58.2%** |
-# | SGD + momentum 0.9 | 35.1% | 68.5% | **72.3%** |
-# | Adam | **71.9%** | 10.1% (stuck) | 10.1% (diverged, loss up to $2\times10^5$) |
+# * **SGD** needs a large learning rate. At 0.001 the loss stays at 2.30 for all 10 epochs and the accuracy is at chance level. Accuracy increases with the learning rate, with the best result **58.2%** at 0.1.
+# * **Momentum** behaves like SGD with a 10 times larger learning rate: momentum at 0.001 gives about the same accuracy as SGD at 0.01 (35.1% and 34.4%). It works well over a wider range (68.5% at 0.01, **72.3%** at 0.1) and reaches the lowest training loss.
+# * **Adam** decreases the loss fastest at the start but only works at 0.001 (**71.9%**). At 0.01 the loss stays at 2.30, and at 0.1 it explodes. Adam's step is roughly $\eta$ for every parameter regardless of the gradient size, so 0.01 is already too large for this network without batch norm.
 #
-# * **Plain SGD** needs a large learning rate: at $10^{-3}$ it does not leave the initial plateau (loss stays at
-#   2.30) within 10 epochs, and accuracy increases monotonically with the learning rate over the grid, i.e. the
-#   best value may even lie above 0.1. It is the slowest optimizer (the training loss at its best rate is still 1.10).
-# * **Momentum** behaves like SGD with a 10× larger effective learning rate $\eta/(1-\mu)$: momentum at $\eta$
-#   matches plain SGD at $10\eta$ (35.1% vs 34.4%; 68.5% vs 58.2%). It is good over a wider range (68–72% for
-#   $\eta\in[0.01,0.1]$) and gives the lowest training loss and best accuracy at $\eta=0.1$.
-# * **Adam** is the fastest at the start (the steepest loss decrease in the right plot, and the best first epoch),
-#   but it is the *most sensitive* optimizer: it only works at $10^{-3}$. Because Adam's step size is about $\eta$ per
-#   parameter regardless of the gradient scale, $\eta=10^{-2}$ already moves every weight by 0.01 per step, which
-#   destroys the initial features of this network without batch norm (the ReLUs die and the loss sticks at
-#   $\ln 10 = 2.30$), and $\eta=0.1$ makes the loss explode.
-#
-# So the "best" learning rate differs by two orders of magnitude between optimizers (0.1 for SGD/momentum, 0.001
-# for Adam) and must be tuned per optimizer; comparing optimizers at a single shared learning rate would be
-# misleading. With its best rate, SGD with momentum slightly outperforms Adam in final accuracy here, while Adam
-# is the easiest to get working quickly with its default $10^{-3}$.
+# The best learning rates differ by a factor of 100 between the optimizers, so each optimizer has to be tuned separately. In this experiment momentum gave the best accuracy and was the least sensitive to the learning rate.
 
 # %% [markdown]
-# ---
 # ## Task 3: Regularization and residual connections
 #
-# ### (a) Regularization on a 5k-image training subset
+# ### 3(a): Regularization on 5,000 training images
 #
-# Model: the same small CNN as in 2(c) with batch norm after every convolution (dropout layers are present
-# but only active when $p>0$). Training data: the first 5,000 images of the 45k training split (classes
-# roughly balanced); validation: the usual 5k validation split. All runs use the same seed, SGD with
-# momentum 0.9, peak learning rate 0.05 with cosine decay, batch size 128 and 100 epochs. Train accuracy is
-# measured on the *clean* (non-augmented) 5k training images in eval mode after every epoch, so it is
-# comparable across methods.
+# The small CNN from 2(c) with batch norm after every convolution is trained on the first 5,000 images of the training split and evaluated on the full validation split. All runs use the same seed, SGD with momentum 0.9, learning rate 0.05 with cosine decay, batch size 128 and 100 epochs. Training accuracy is measured on the clean (non-augmented) training images in eval mode.
 #
-# | variant | setting |
-# |---|---|
-# | baseline | no regularization |
-# | weight decay | L2 penalty $5\times10^{-4}$ (coupled, via the optimizer) |
-# | dropout | $p = 0.3$ after each pooling stage and before the classifier |
-# | flip + crop | random horizontal flip + random 32×32 crop of the 4-pixel padded image |
-# | cutout | one random 16×16 square zeroed per image (own implementation, `cutout` above) |
-# | mixup | $\tilde x = \lambda x_i + (1-\lambda)x_j$, loss $\lambda\,\mathrm{CE}(y_i) + (1-\lambda)\,\mathrm{CE}(y_j)$, $\lambda\sim\mathrm{Beta}(0.4, 0.4)$ (own implementation, `mixup` above) |
-# | all combined | all of the above together |
+# * **weight decay:** $5\times10^{-4}$
+# * **dropout:** $p = 0.3$ after each pooling stage and before the classifier
+# * **flip + crop:** random horizontal flip and random 32×32 crop of the image padded by 4 pixels
+# * **cutout:** one random 16×16 square set to zero (the mean) in each image
+# * **mixup:** $\tilde x = \lambda x_i + (1-\lambda)x_j$ with loss $\lambda\,\mathrm{CE}(y_i) + (1-\lambda)\,\mathrm{CE}(y_j)$, $\lambda\sim\mathrm{Beta}(0.4, 0.4)$
+# * **all combined:** all of the above together
 
 # %%
 X_small, y_small = X_tr[:5000], y_tr[:5000]
@@ -963,7 +839,7 @@ def run_3a(name, n_epochs=100):
                tag=name)
 
 
-R3a = {k: cached(f"task3a_{k.replace(' ', '_').replace('+', '_')}", lambda k=k: run_3a(k, epochs(100)))
+R3a = {k: cached(f"task3a_{k.replace(' ', '_').replace('+', '_')}", lambda k=k: run_3a(k, 100))
        for k in VARIANTS_3A}
 
 # %%
@@ -1002,56 +878,24 @@ ax.set_title("Final train vs validation accuracy (5k training images)"); ax.lege
 plt.tight_layout(); savefig("task3a_gap"); plt.show()
 
 # %% [markdown]
-# **Interpretation.** Results after 100 epochs on 5k images (train accuracy on clean training images):
+# **Interpretation:** The baseline fits the 5,000 training images perfectly (100% training accuracy) and reaches **68.2%** validation accuracy, a gap of **31.8 points**.
 #
-# | variant | train acc | val acc | gap | final val loss |
-# |---|---|---|---|---|
-# | baseline | 100.0% | 68.2% | 31.8 | 1.41 |
-# | weight decay | 100.0% | 67.9% | 32.1 | 1.26 |
-# | dropout | 98.2% | 70.1% | 28.1 | 0.97 |
-# | flip + crop | 96.8% | **73.9%** | 22.9 | 0.95 |
-# | cutout | 100.0% | 71.1% | 28.9 | 1.20 |
-# | mixup | 100.0% | 68.6% | 31.4 | 0.97 |
-# | all combined | 76.2% | 67.0% | **9.2** | **0.93** |
+# * **Flip + crop** is the best single method (**73.9%**, gap 22.9). Flipped and slightly shifted images keep the same class, so this works like adding new training images.
+# * **Cutout** (71.1%) and **dropout** (70.1%) also help. Cutout makes the model use more parts of the object, and dropout reduces the reliance on individual features. Only dropout and flip + crop keep the training accuracy below 100%.
+# * **Weight decay** does not change the accuracy (67.9%). With batch norm after every convolution the output does not depend on the scale of the convolution weights, so weight decay mainly changes the effective learning rate. It does lower the validation loss from 1.41 to 1.26.
+# * **Mixup** gives a similar accuracy to the baseline (68.6%), but the validation loss drops from 1.41 to 0.97, so the predictions are less overconfident.
+# * **All combined** has the smallest gap (**9.2 points**) and the lowest validation loss, but the training accuracy is only 76.2% and the validation accuracy (67.0%) is below flip + crop alone. Together the methods regularize too strongly for this small model and a 100-epoch budget; the curves are still rising at the end of training.
 #
-# * With only 5k images the **baseline** memorises the training set within ~35 epochs (100% train accuracy) and
-#   stalls at 68% validation accuracy: a 32-point generalisation gap. Its validation loss is also the highest and
-#   very noisy, because the network becomes over-confident.
-# * **Flip + crop** is the most effective single regulariser (+5.8 points, smallest gap among single methods):
-#   it encodes real invariances of natural images (left–right symmetry, small translations), effectively
-#   multiplying the size of the training set. **Cutout** (+2.9) forces the network to use several parts of the
-#   object instead of a single discriminative patch, but on its own the network still reaches 100% on clean
-#   training images. **Dropout** (+1.9) reduces co-adaptation of features and is the only single method besides
-#   flip+crop that keeps train accuracy below 100%.
-# * **Weight decay** barely changes accuracy here. With batch norm after every conv the network output is invariant
-#   to the scale of the conv weights, so L2 mainly increases the effective learning rate rather than restricting
-#   capacity; it does lower the validation loss (1.41 → 1.26). **Mixup** gives a similar accuracy to the baseline, but
-#   the validation loss drops from 1.41 to 0.97: training on interpolated images with soft targets makes the predictions
-#   much better calibrated (less over-confident), even though the arg-max decisions change little.
-# * **All combined** has by far the smallest gap (9 points) and the lowest validation loss, but it **underfits**: the
-#   train accuracy only reaches 76% and validation accuracy (67%) is lower than with flip+crop alone. Stacking five
-#   regularisers on a 0.14M-parameter network trained for only 4k iterations removes too much effective capacity;
-#   the curves are still rising at epoch 100, so a bigger model or a longer schedule would be needed to benefit from it.
-#
-# In short, regularisation trades training fit for generalisation; the best choice depends on the capacity/data/compute
-# balance, and data augmentation that reflects true invariances (flip + crop) is the most valuable when data is scarce.
+# Combining all regularizers reduces the gap but does not give the best accuracy here.
 
 # %% [markdown]
-# ### (b) Plain vs residual CIFAR networks of depth $6n+2$ (8, 20, 56)
+# ### 3(b): Plain and residual networks of depth 6n + 2
 #
-# Architecture of He et al. (2016) for CIFAR: a 3×3 conv with 16 channels, then three stages of $n$ basic
-# blocks (two 3×3 conv–BN layers each) with 16/32/64 channels at resolutions 32/16/8 (the first conv of
-# stages 2 and 3 has stride 2), global average pooling and a 10-way FC layer; $6n+2$ weighted layers in total.
-# Kaiming-normal initialization (fan-out, ReLU) for all convolutions, BN with $\gamma=1, \beta=0$.
+# Following He et al. (2016): a 3×3 convolution with 16 channels, three stages of $n$ blocks with 16/32/64 channels (each block has two 3×3 convolutions with batch norm), global average pooling and a linear layer. The first convolution of stages 2 and 3 has stride 2. Depths 8, 20 and 56 correspond to $n$ = 1, 3 and 9. Convolutions use Kaiming-normal initialization.
 #
-# The **only** difference between the two families is the shortcut: residual blocks compute
-# $\mathrm{ReLU}(F(x) + s(x))$ and plain blocks $\mathrm{ReLU}(F(x))$. We use the parameter-free option-A
-# shortcut (identity; when the shape changes, stride-2 subsampling and zero-padding of the extra channels),
-# so plain and residual networks of the same depth have *exactly* the same parameters.
+# The only difference between the two families is the shortcut: a residual block computes $\mathrm{ReLU}(F(x) + x)$ and a plain block $\mathrm{ReLU}(F(x))$. When the shape changes, the shortcut subsamples with stride 2 and zero-pads the extra channels (option A), so it has no parameters and both networks of the same depth have exactly the same parameters.
 #
-# Training (identical for all 6 networks): SGD, momentum 0.9, weight decay $10^{-4}$, batch 128, peak learning
-# rate 0.1 with 1 epoch of linear warm-up and cosine decay, flip + crop augmentation, 20 epochs on the 45k split
-# (fp32 on the GTX 1650; fp16 mixed precision is used automatically on tensor-core GPUs such as the T4).
+# All six networks are trained with SGD (momentum 0.9, weight decay $10^{-4}$), batch size 128, learning rate 0.1 with one epoch of warm-up and cosine decay, flip + crop augmentation, for 20 epochs on the 45,000 training images.
 
 # %%
 class ShortcutA(nn.Module):
@@ -1145,7 +989,7 @@ def run_3b(depth, residual, n_epochs=20):
                tag=f"{'res' if residual else 'plain'}-{depth}")
 
 
-R3b = {(d, r): cached(f"task3b_{'res' if r else 'plain'}{d}", lambda d=d, r=r: run_3b(d, r, epochs(20)))
+R3b = {(d, r): cached(f"task3b_{'res' if r else 'plain'}{d}", lambda d=d, r=r: run_3b(d, r, 20))
        for d in (8, 20, 56) for r in (False, True)}
 
 # %%
@@ -1178,51 +1022,21 @@ display(t3b.style.format({"parameters": "{:,}"} | {c: "{:.4f}" for c in t3b.colu
                          | {c: "{:.1f}" for c in t3b.columns if "s/epoch" in c}))
 
 # %% [markdown]
-# **Explanation.** Final training loss / validation accuracy after 20 epochs:
+# **Interpretation:**
 #
-# | depth | plain | residual |
-# |---|---|---|
-# | 8 | 0.450 / 82.9% | 0.477 / 83.0% |
-# | 20 | 0.319 / 85.6% | 0.232 / 88.1% |
-# | 56 | **1.147 / 59.3%** | **0.168 / 88.9%** |
-#
-# * **Plain networks degrade with depth.** Going from 8 to 20 layers still helps a little, but the 56-layer plain
-#   network is dramatically *worse*: its training loss after 20 epochs (1.15) is 2.5× that of the 8-layer plain
-#   network, and its loss curve decreases only slowly from the start. Because it is the **training** loss that is
-#   higher (and the validation accuracy is lower by the same amount), this is not overfitting but an
-#   **optimization problem**: a 56-layer network can represent everything the 8-layer one can (extra layers could
-#   learn the identity), yet SGD fails to find such a solution. This is the *degradation problem* of He et al.
-#   Even with batch norm and Kaiming initialization (so the gradients do not simply vanish at initialization, cf.
-#   Task 1(d)), the composition of 54 non-linear layers is a badly conditioned function to optimize, and the
-#   gradient signal reaching the early layers is weak and noisy.
-# * **Residual networks improve with depth**: training loss 0.48 → 0.23 → 0.17 and validation accuracy
-#   83.0% → 88.1% → 88.9%. With a shortcut each block only has to learn a residual $F(x) = H(x) - x$; driving
-#   $F$ towards 0 gives the identity, so extra depth can never hurt much, and the identity paths carry the gradient
-#   unchanged to every layer ($\partial x_L/\partial x_\ell = I + \partial(\sum F)/\partial x_\ell$), which makes the deep
-#   network as easy to optimize as a shallow one. ResNet-56 has the lowest training loss of all six models and also
-#   the best validation accuracy.
-# * At **depth 8** the shortcut makes no difference (the two curves overlap): a 3-block network is easy to optimize
-#   either way. The benefit of the shortcut grows with depth (+2.5 points at 20 layers, +29.7 points at 56 layers),
-#   and since the shortcuts are parameter-free (option A) the comparison isolates the effect of the skip connection
-#   itself. The cost of depth is compute: ResNet-56 needs about 8× the time per epoch of ResNet-8 on this GPU.
+# * **Plain networks get worse with depth.** Plain-56 ends with a training loss of **1.15**, much higher than plain-20 (0.32) and plain-8 (0.45), and its validation accuracy is only 59.3%. Since the *training* loss is higher, this is an optimization problem and not overfitting. A 56-layer network can represent anything the 8-layer network can, but SGD does not find such a solution. This is the degradation problem described by He et al.
+# * **Residual networks improve with depth.** The training loss goes from 0.48 to 0.23 to **0.17** and the validation accuracy from 83.0% to 88.1% to **88.9%**. Each block only has to learn a correction $F(x)$ that is added to $x$, so the identity is easy to represent, and the shortcuts pass the gradient directly to the early layers.
+# * At depth 8 the shortcut makes no difference. The gap grows with depth: 2.5 points at depth 20 and 29.7 points at depth 56.
+# * The deeper networks cost more compute: ResNet-56 takes about 8 times longer per epoch than ResNet-8.
 
 # %% [markdown]
-# ---
-# ## Task 4: Best CNN with ≤ 500k parameters and ≤ 20 epochs
+# ## Task 4 (optional): Best CNN with at most 500k parameters and 20 epochs
 #
-# **Design.** With only 20 epochs, a shallow-but-wide residual network trains faster than a deep-thin one
-# (Task 3b), so the model is a ResNet with 2 basic blocks per stage (14 weighted layers), widths 26/52/104,
-# projection (1×1 conv) shortcuts at the stage transitions and the last BN of every residual branch
-# initialized to zero (each block starts as the identity). Recipe of the full model:
+# **Design.** Task 3(b) showed that residual networks train well, and with only 20 epochs a shallow, wider network is a better use of the budget than a deep, thin one. The model is a ResNet with 2 blocks per stage (14 layers), widths 26/52/104, 1×1 convolution shortcuts where the shape changes, and the last batch-norm scale of each block initialized to zero, so that each block starts as the identity. It has 460,548 parameters.
 #
-# * SGD with Nesterov momentum 0.9, batch 128, peak LR 0.1, 1 epoch linear warm-up then cosine decay to 0,
-# * weight decay $5\times10^{-4}$, label smoothing 0.1,
-# * augmentation: random flip + crop and cutout (16×16),
-# * 20 epochs on the 45k training split; model selection only on the 5k validation split.
+# Training: SGD with Nesterov momentum 0.9, batch size 128, peak learning rate 0.1 with one epoch of warm-up and cosine decay, weight decay $5\times10^{-4}$, label smoothing 0.1, flip + crop and cutout (16×16), 20 epochs on the 45,000 training images.
 #
-# **Ablation.** Each variant changes one design choice of the full model and is trained with the same seed
-# and budget. The final model is the variant with the best validation accuracy; only that model is
-# evaluated on the test set, once.
+# **Ablation.** Each variant changes one design choice and is trained with the same seed and budget. The final model is the variant with the best final validation accuracy, and only this model is evaluated on the test set.
 
 # %%
 T4_ARCH = dict(blocks=(2, 2, 2), widths=(26, 52, 104), shortcut="B", zero_init_last_bn=True)
@@ -1260,7 +1074,7 @@ def run_4(name, n_epochs=20):
 
 
 R4 = {k: cached(f"task4_{k.replace(' ', '_').replace('(', '').replace(')', '').replace('+', '_')}",
-                lambda k=k: run_4(k, epochs(20))) for k in VARIANTS_4}
+                lambda k=k: run_4(k, 20)) for k in VARIANTS_4}
 
 # %%
 base = R4["full model"]["val_acc"][-1]
@@ -1285,46 +1099,21 @@ for a in ax:
 plt.tight_layout(); savefig("task4_ablation"); plt.show()
 
 # %% [markdown]
-# **Ablation discussion.** All variants have the same 20-epoch budget and seed (final-epoch validation accuracy):
+# **Interpretation:** The full model reaches **88.96%** validation accuracy.
 #
-# | variant | val acc | change | final train loss |
-# |---|---|---|---|
-# | full model (flip + crop + cutout, wd $5\times10^{-4}$, LS 0.1, SGD-Nesterov) | 88.96% | – | 0.823 |
-# | no shortcut (plain) | 88.78% | −0.18 | 0.815 |
-# | no augmentation | 86.54% | −2.42 | 0.526 |
-# | **no cutout (flip + crop only)** | **90.78%** | **+1.82** | 0.662 |
-# | no weight decay | 86.48% | −2.48 | 0.906 |
-# | no label smoothing | 89.26% | +0.30 | 0.368 |
-# | AdamW instead of SGD | 87.10% | −1.86 | 0.875 |
+# * **Cutout:** removing it gives the best result, **90.78%** (+1.8 points). With cutout the training loss stays higher (0.82 vs 0.66), so the model underfits in 20 epochs. Cutout seems to need a longer training schedule.
+# * **Augmentation:** without any augmentation the accuracy drops to 86.54% (-2.4) and the training loss is the lowest of all label-smoothed runs (0.53), so the model memorises the training set.
+# * **Weight decay:** without it the accuracy drops to 86.48% (-2.5) and the training loss is *higher* (0.91). With batch norm, weight decay keeps the weight norms small, which keeps the effective learning rate high; without it training slows down.
+# * **Optimizer:** AdamW (learning rate 0.002, weight decay 0.05) gives 87.10% (-1.9), below SGD with Nesterov momentum.
+# * **Shortcut:** removing the shortcuts costs only 0.2 points at 14 layers, which agrees with Task 3(b) where the difference is small for shallow networks.
+# * **Label smoothing:** removing it changes the accuracy by +0.3 points, which is within run-to-run variation.
 #
-# (With label smoothing 0.1 the training loss cannot go below ≈0.5, so losses are only comparable among the
-# label-smoothed runs.)
-#
-# * **Augmentation** matters most on the data side: without any augmentation the training loss drops to the
-#   label-smoothing floor (memorisation) and validation accuracy falls by 2.4 points. But **cutout on top of
-#   flip + crop hurts with only 20 epochs** (−1.8 points vs flip + crop only): the training loss is still high (0.82 vs
-#   0.66), i.e. the model is *under*-fitted. Cutout is a strong regulariser that pays off in long (200-epoch) schedules,
-#   not in a 20-epoch budget, the same capacity/budget trade-off as "all combined" in Task 3(a).
-# * **Weight decay** is essential (−2.5 points without it). Interestingly its removal makes the *training* loss higher,
-#   not lower: with batch norm the convolutions are scale-invariant, and without weight decay their norms grow, which
-#   shrinks the effective learning rate $\eta/\|w\|^2$ and slows optimization. So in BN networks weight decay acts mainly
-#   as an effective-learning-rate control.
-# * **Optimizer:** AdamW (lr $2\times10^{-3}$, decoupled wd 0.05, same schedule) is 1.9 points worse than SGD with Nesterov
-#   momentum, in line with Task 2(c) where tuned momentum-SGD also edged out Adam on CIFAR.
-# * **Shortcut:** at this depth (14 layers) removing the shortcuts costs only 0.2 points, consistent with Task 3(b) where
-#   the gap between plain and residual networks is small for shallow networks and only becomes large with depth.
-#   It is kept because it makes optimization robust and costs no time.
-# * **Label smoothing** changes accuracy by only +0.3 points (within run-to-run noise of a few tenths of a percent).
-#
-# Following the selection rule (best final validation accuracy), the **final model is the residual network with
-# flip + crop (no cutout), weight decay $5\times10^{-4}$, label smoothing 0.1 and SGD-Nesterov** (460,548 parameters,
-# 20 epochs, 90.78% validation accuracy).
+# With label smoothing 0.1 the training loss cannot go below about 0.5, so training losses are only compared between runs that use it. Following the selection rule, the final model is the residual network **without cutout** (flip + crop, weight decay, label smoothing, SGD with Nesterov momentum), with 90.78% validation accuracy.
 
 # %% [markdown]
-# ### Final model: single evaluation on the test set
+# ### Final test evaluation
 #
-# The variant with the highest final validation accuracy is selected and its saved weights are evaluated on
-# the 10k CIFAR-10 test images. The result is cached, so the test set is used exactly once.
+# The saved weights of the selected model are evaluated once on the 10,000 test images. The result is saved, so the test set is not evaluated again when the notebook is re-run.
 
 # %%
 FINAL = max(R4, key=lambda k: R4[k]["val_acc"][-1])
@@ -1367,21 +1156,6 @@ ax[1].set(title="Per-class test accuracy", xlabel="accuracy"); ax[1].invert_yaxi
 plt.tight_layout(); savefig("task4_test"); plt.show()
 
 # %% [markdown]
-# **Test result.** The selected model reaches **90.36% test accuracy** (evaluated once), with 460,548 parameters
-# (< 500k) and 20 training epochs. This is only 0.4 points below its validation accuracy (90.78%), so selecting among
-# seven variants on the 5k validation split introduced little optimistic bias. The per-class results show where the
-# remaining errors are: vehicles are easiest (automobile 95.6%, ship 94.7%, truck 93.6%), while the animal classes with
-# similar shapes and textures are hardest: **cat (80.0%) and dog (85.1%) are mostly confused with each other** (85 cats
-# predicted as dog and 86 dogs as cat), and bird (85.5%) is confused with airplane, deer and frog. The vehicle errors
-# are also semantically sensible (truck ↔ automobile, ship ↔ airplane, which share sky/sea backgrounds).
+# **Interpretation:** The final model reaches **90.36% test accuracy** with 460,548 parameters and 20 training epochs. This is 0.4 points below its validation accuracy (90.78%), so choosing between seven variants on the validation split did not overfit it much.
 #
-# ---
-# ## Summary
-#
-# | task | key result |
-# |---|---|
-# | 1 | Manual backprop matches autograd to ~$10^{-16}$ and finite differences to ~$10^{-9}$; MLP: 52.0% val. accuracy with strong overfitting; sigmoid gradients vanish ~$10^4$× over 10 layers, ReLU + He init keeps them constant. |
-# | 2 | Own SGD-momentum/Adam match `torch.optim` exactly; momentum and Adam fix the zig-zag of SGD on an ill-conditioned quadratic; Adam is best at lr $10^{-3}$ but fails at $\ge 10^{-2}$, momentum-SGD is the most robust (72.3% at lr 0.1). |
-# | 3a | On 5k images flip + crop is the best single regulariser (68.2% → 73.9%); combining all regularisers minimises the gap (9 points) but underfits. |
-# | 3b | Plain nets degrade with depth (56 layers: train loss 1.15, 59.3%), residual nets improve (ResNet-56: 0.17, 88.9%): shortcuts solve an optimization problem, not overfitting. |
-# | 4 | 460k-parameter ResNet, 20 epochs: **90.36% test accuracy**; weight decay and augmentation matter most, cutout hurts at this short budget. |
+# The vehicle classes are the easiest (automobile 95.6%, ship 94.7%, truck 93.6%). The hardest are **cat (80.0%) and dog (85.1%)**, which are mostly confused with each other: 85 cats are predicted as dog and 86 dogs as cat. Bird (85.5%) is confused with airplane, deer and frog.
